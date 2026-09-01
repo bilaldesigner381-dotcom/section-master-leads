@@ -1,0 +1,27 @@
+   name: Hourly Lead Finder
+
+   on:
+     schedule:
+       - cron: '0 * * * *'
+     workflow_dispatch:
+
+   jobs:
+     find-leads:
+       runs-on: ubuntu-latest
+       steps:
+         - name: Checkout code
+           uses: actions/checkout@v4
+
+         - name: Set up Python
+           uses: actions/setup-python@v5
+           with:
+             python-version: '3.12'
+
+         - name: Install dependencies
+           run: pip install -r requirements.txt
+
+         - name: Write Google token file
+           run: echo '${{ secrets.TOKEN_JSON }}' > token.json
+
+         - name: Run lead finder script
+           run: python lead_finder.py
