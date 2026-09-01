@@ -43,7 +43,7 @@ SHEET_NAME = "Section Master Leads"
 def find_store_urls(niche, max_results=10):
     all_urls = []
     templates = SEARCH_TEMPLATES.copy()
-    random.shuffle(templates)
+    random.shuffle(templates)  # har run mein order badalta rahe, taake alag results milein
 
     for template in templates:
         query = template.format(niche=niche)
@@ -100,6 +100,7 @@ def check_store(url):
 # ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Quality Signal) ----------
 
 def get_product_count(store_url):
+    """Store ke actual products count karta hai - zyada products = zyada serious/active store"""
     base_match = re.match(r'(https?://[^/]+)', store_url)
     if not base_match:
         return None
@@ -194,21 +195,24 @@ def find_email(store_url):
 # ---------- STEP 5: LEAD SCORE CALCULATE KARNA (Fun Factor!) ----------
 
 def calculate_lead_score(is_default_theme, product_count, email_found):
+    """0-100 ka score deta hai - jitna zyada, utni behtar lead"""
     score = 0
 
     if is_default_theme:
-        score += 40
+        score += 40  # default theme = customization ki zaroorat, high priority
+    else:
+        score += 10  # custom theme hai, phir bhi potential lead, kam priority
 
     if product_count is not None:
         if product_count >= 20:
-            score += 35
+            score += 35  # bohat products = serious/active business
         elif product_count >= 5:
             score += 20
         else:
-            score += 5
+            score += 5  # bohat kam products, shayad naya/inactive store
 
     if email_found and email_found != "Nahi mila" and not email_found.startswith("Facebook"):
-        score += 25
+        score += 25  # direct email mila = aasani se contact ho sakta hai
 
     return min(score, 100)
 
@@ -271,6 +275,7 @@ def run_once():
     new_leads_count = 0
     hot_leads_count = 0
 
+    # Niches ko shuffle karna, taake har run mein alag order se coverage mile
     shuffled_niches = niches.copy()
     random.shuffle(shuffled_niches)
 
@@ -289,9 +294,13 @@ def run_once():
             if result is None:
                 continue
 
-            if result["is_lead"]:
+            if result is not None:
+                is_default = result["is_lead"]
                 result["niche"] = niche
-                result["reason"] = f"Default '{result['schema_name']}' theme use kar rahe hain — customization ki zaroorat hai"
+                if is_default:
+                    result["reason"] = f"Default '{result['schema_name']}' theme use kar rahe hain — customization ki zaroorat hai"
+                else:
+                    result["reason"] = f"Custom '{result['schema_name']}' theme, lekin phir bhi potential lead"
 
                 email = find_email(url)
                 result["email"] = email
@@ -301,7 +310,7 @@ def run_once():
                 result["product_count"] = product_count
                 time.sleep(1)
 
-                score = calculate_lead_score(True, product_count, email)
+                score = calculate_lead_score(is_default, product_count, email)
                 result["score"] = score
                 result["quality"] = get_quality_label(score)
 
