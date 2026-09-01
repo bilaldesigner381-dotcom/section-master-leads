@@ -1,26 +1,38 @@
 import requests
 import re
 import time
+import random
 import gspread
 from google.oauth2.credentials import Credentials
 from ddgs import DDGS
 
 # ---------- SETTINGS ----------
 
-niches = ["jewelry", "candles", "fitness", "skincare", "pet supplies"]
+niches = [
+    "jewelry", "candles", "fitness", "skincare", "pet supplies",
+    "home decor", "clothing boutique", "shoes", "handbags", "sunglasses",
+    "coffee", "tea", "supplements", "baby products", "toys",
+    "phone accessories", "art prints", "furniture", "kitchenware", "bags",
+    "watches", "beauty products", "outdoor gear", "cycling gear", "yoga",
+    "gaming accessories", "electronics", "stationery", "plants", "swimwear",
+]
 
 default_theme_names = ["dawn", "debut", "craft", "sense", "refresh", "taste", "studio", "ride"]
 
 SEARCH_TEMPLATES = [
     '"powered by shopify" {niche} store',
     '{niche} online store shopify -site:myshopify.com',
+    '{niche} shop "add to cart" shopify',
+    'buy {niche} online shopify store',
+    '{niche} boutique shopify -blog',
 ]
 
 BLOCKED_DOMAINS = [
     "myshopify.com", "shopify.com", "pinterest.com", "facebook.com",
     "instagram.com", "youtube.com", "medium.com", "reddit.com",
     "wikipedia.org", "amazon.com", "etsy.com", "gempages.net",
-    "omnisend.com", "bsscommerce.com", "webinopoly.com",
+    "omnisend.com", "bsscommerce.com", "webinopoly.com", "ebay.com",
+    "walmart.com", "target.com", "aliexpress.com",
 ]
 
 SHEET_NAME = "Section Master Leads"
@@ -30,7 +42,10 @@ SHEET_NAME = "Section Master Leads"
 
 def find_store_urls(niche, max_results=10):
     all_urls = []
-    for template in SEARCH_TEMPLATES:
+    templates = SEARCH_TEMPLATES.copy()
+    random.shuffle(templates)
+
+    for template in templates:
         query = template.format(niche=niche)
         print(f"🔍 Searching: '{query}'")
         try:
@@ -49,7 +64,7 @@ def find_store_urls(niche, max_results=10):
                 continue
             all_urls.append(url)
 
-        time.sleep(3)
+        time.sleep(2)
 
     return list(dict.fromkeys(all_urls))
 
@@ -82,7 +97,27 @@ def check_store(url):
     }
 
 
-# ---------- STEP 3: EMAIL DHOONDNA ----------
+# ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Quality Signal) ----------
+
+def get_product_count(store_url):
+    base_match = re.match(r'(https?://[^/]+)', store_url)
+    if not base_match:
+        return None
+
+    base_url = base_match.group(1)
+    try:
+        response = requests.get(f"{base_url}/products.json?limit=250", timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            count = len(data.get("products", []))
+            return count
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------- STEP 4: EMAIL DHOONDNA ----------
 
 IGNORE_KEYWORDS = ["example.com", "sentry", "wixpress", "godaddy", "yourdomain",
                     "domain.com", "email.com", "test.com", ".png", ".jpg", ".jpeg",
@@ -156,7 +191,38 @@ def find_email(store_url):
     return "Nahi mila"
 
 
-# ---------- STEP 4: GOOGLE SHEETS ----------
+# ---------- STEP 5: LEAD SCORE CALCULATE KARNA (Fun Factor!) ----------
+
+def calculate_lead_score(is_default_theme, product_count, email_found):
+    score = 0
+
+    if is_default_theme:
+        score += 40
+
+    if product_count is not None:
+        if product_count >= 20:
+            score += 35
+        elif product_count >= 5:
+            score += 20
+        else:
+            score += 5
+
+    if email_found and email_found != "Nahi mila" and not email_found.startswith("Facebook"):
+        score += 25
+
+    return min(score, 100)
+
+
+def get_quality_label(score):
+    if score >= 70:
+        return "🔥 Hot Lead"
+    elif score >= 40:
+        return "⭐ Warm Lead"
+    else:
+        return "🌱 Cold Lead"
+
+
+# ---------- STEP 6: GOOGLE SHEETS ----------
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
@@ -169,7 +235,7 @@ def get_or_create_sheet():
     except gspread.SpreadsheetNotFound:
         spreadsheet = gc.create(SHEET_NAME)
         sheet = spreadsheet.sheet1
-        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Reason"])
+        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Products", "Lead Score", "Quality", "Reason"])
     return sheet
 
 
@@ -187,6 +253,9 @@ def save_lead_to_sheet(sheet, lead):
         lead["niche"],
         lead["theme_name"],
         lead["email"],
+        lead["product_count"] if lead["product_count"] is not None else "N/A",
+        lead["score"],
+        lead["quality"],
         lead["reason"],
     ])
 
@@ -200,11 +269,15 @@ def run_once():
     print(f"✅ Connected! Sheet mein pehle se {len(existing_urls)} leads hain.\n")
 
     new_leads_count = 0
+    hot_leads_count = 0
 
-    for niche in niches:
+    shuffled_niches = niches.copy()
+    random.shuffle(shuffled_niches)
+
+    for niche in shuffled_niches:
         urls = find_store_urls(niche, max_results=10)
         print(f"   {len(urls)} store URLs mile is niche mein.\n")
-        time.sleep(5)
+        time.sleep(3)
 
         for url in urls:
             if url in existing_urls:
@@ -224,12 +297,24 @@ def run_once():
                 result["email"] = email
                 time.sleep(1)
 
+                product_count = get_product_count(url)
+                result["product_count"] = product_count
+                time.sleep(1)
+
+                score = calculate_lead_score(True, product_count, email)
+                result["score"] = score
+                result["quality"] = get_quality_label(score)
+
                 save_lead_to_sheet(sheet, result)
                 existing_urls.add(url)
                 new_leads_count += 1
-                print(f"   ✅ NAYI LEAD: {url} (Theme: {result['theme_name']}) | Email: {email}")
+                if score >= 70:
+                    hot_leads_count += 1
 
-    print(f"\n===== DONE ===== Total {new_leads_count} nayi leads add hui is run mein.\n")
+                print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
+
+    print(f"\n===== DONE =====")
+    print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!\n")
 
 
 if __name__ == "__main__":
