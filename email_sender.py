@@ -91,6 +91,12 @@ def run_once():
     niche_col_index = header.index("Niche")
     url_col_index = header.index("Store URL")
 
+    # Har row ko header ki length tak pad karo, taake short rows pe index error na aaye
+    target_len = len(header)
+    for row in all_rows[1:]:
+        while len(row) < target_len:
+            row.append("")
+
     # Sab already-emailed EMAIL ADDRESSES ka set bana lo (URL ke bajaye email track karna,
     # taake duplicate stores jinka email same ho unhe dobara email na jaye)
     already_emailed_addresses = set()
@@ -117,6 +123,8 @@ def run_once():
             email = row[email_col_index] if len(row) > email_col_index else ""
 
             if not email or email == "Nahi mila" or email.startswith("Facebook"):
+                continue
+            if re.match(r'^x+@x+\.x+$', email.lower()):  # xxx@xxx.xxx jaisi fake/placeholder emails
                 continue
             if email.lower() in already_emailed_addresses:  # ye email pehle hi kisi row se ja chuki hai
                 continue
