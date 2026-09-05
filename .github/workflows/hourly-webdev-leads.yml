@@ -19,7 +19,7 @@ jobs:
       - name: Write Google token file
         run: echo '${{ secrets.TOKEN_JSON }}' > token.json
       - name: Run web dev lead finder script
-        run: python 'lead_finder_osm.py
+        run: python 'lead_finder_webdev.py
       - name: Run web dev email sender script
         env:
           GMAIL_1_ADDRESS: ${{ secrets.GMAIL_1_ADDRESS }}
