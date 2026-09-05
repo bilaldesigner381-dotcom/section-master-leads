@@ -19,4 +19,4 @@ jobs:
       - name: Write Google token file
         run: echo '${{ secrets.TOKEN_JSON }}' > token.json
       - name: Run OSM lead finder script
-        run: python lead_finder_osm.py
+        run: python lead_finder_osm.py --debug
