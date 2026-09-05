@@ -40,7 +40,23 @@ LOCATIONS = [
     ("Berlin", "", "Germany"), ("Amsterdam", "", "Netherlands"),
 ]
 
-PLATFORMS = ["facebook.com", "instagram.com", "linkedin.com"]
+PLATFORMS = ["facebook.com", "instagram.com", "linkedin.com/company"]
+
+# Personal profiles, posts, groups, and other non-business-page URL patterns —
+# in inko lead ke taur par nahi lena kyunke yeh actual business page nahi hain
+JUNK_URL_PATTERNS = [
+    "facebook.com/people/", "facebook.com/profile.php", "facebook.com/groups/",
+    "facebook.com/pages/category", "facebook.com/watch", "facebook.com/marketplace",
+    "instagram.com/p/", "instagram.com/reel/", "instagram.com/stories/", "instagram.com/explore/",
+    "linkedin.com/in/", "linkedin.com/posts/", "linkedin.com/jobs/",
+]
+
+# Yeh keywords indicate karte hain ke business band ho chuka hai — aisi
+# leads bilkul faida mand nahi, isliye skip
+CLOSED_KEYWORDS = [
+    "permanently closed", "temporarily closed", "out of business",
+    "no longer in business", "this business has closed",
+]
 
 # Directories/socials jinko "independent website" nahi maana jayega
 NON_WEBSITE_DOMAINS = [
@@ -56,6 +72,28 @@ IGNORE_EMAIL_KEYWORDS = [
     "domain.com", "email.com", "test.com", ".png", ".jpg", ".jpeg",
     ".gif", ".webp", ".svg", "noreply", "no-reply", "@2x", "@3x",
 ]
+
+# Sirf inhi free/generic email providers ko "quality lead" mana jayega.
+# Business jo apna khud ka domain-email (info@apnicompany.com) use kar raha
+# ho, uska matlab hai woh pehle se kisi domain/hosting ka istemal kar raha
+# hai — jo hamare "no website" signal ko kamzor karta hai. Isliye sirf
+# generic-provider email wali leads hi rakhi jayengi.
+FREE_EMAIL_PROVIDERS = {
+    "gmail.com", "googlemail.com",
+    "hotmail.com", "hotmail.co.uk", "hotmail.fr",
+    "yahoo.com", "yahoo.co.uk", "yahoo.com.au",
+    "outlook.com", "live.com", "msn.com",
+    "icloud.com", "me.com",
+    "aol.com", "ymail.com", "rocketmail.com",
+    "protonmail.com", "proton.me",
+}
+
+
+def is_free_provider_email(email):
+    if "@" not in email:
+        return False
+    domain = email.split("@")[-1].lower().strip()
+    return domain in FREE_EMAIL_PROVIDERS
 
 SHEET_NAME = "WebDev Leads"
 
@@ -89,6 +127,15 @@ def find_social_leads(niche, city, region, country, platform):
         body = r.get("body", "")
         if not url:
             continue
+
+        url_lower = url.lower()
+        if any(pattern in url_lower for pattern in JUNK_URL_PATTERNS):
+            continue  # personal profile, post, group, ya job listing — business page nahi
+
+        combined_text = f"{title} {body}".lower()
+        if any(kw in combined_text for kw in CLOSED_KEYWORDS):
+            continue  # business band ho chuka hai
+
         leads.append({
             "platform": platform,
             "profile_url": url,
@@ -143,15 +190,18 @@ def has_own_website(business_name, city, country):
 EMAIL_PATTERN = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
 
-def extract_emails_from_text(text):
+def extract_emails_from_text(text, free_provider_only=True):
     if not text:
         return []
     found = re.findall(EMAIL_PATTERN, text)
     clean = []
     for email in found:
         email_lower = email.lower()
-        if not any(bad in email_lower for bad in IGNORE_EMAIL_KEYWORDS):
-            clean.append(email)
+        if any(bad in email_lower for bad in IGNORE_EMAIL_KEYWORDS):
+            continue
+        if free_provider_only and not is_free_provider_email(email_lower):
+            continue
+        clean.append(email)
     return list(dict.fromkeys(clean))
 
 
@@ -187,20 +237,49 @@ def find_email(lead):
 
 
 # =====================================================================
+# STEP 3.5: EXTRA QUALITY SIGNALS (phone number, ratings/reviews)
+# =====================================================================
+
+PHONE_PATTERN = r'(\+?\d[\d\s().-]{7,}\d)'
+RATING_PATTERN = r'(\d(?:\.\d)?)\s*(?:stars?|★|/\s*5)'
+REVIEW_COUNT_PATTERN = r'(\d+)\s*(?:reviews?|ratings?)'
+
+
+def has_phone_number(text):
+    if not text:
+        return False
+    return bool(re.search(PHONE_PATTERN, text))
+
+
+def has_ratings_or_reviews(text):
+    if not text:
+        return False
+    return bool(re.search(RATING_PATTERN, text, re.IGNORECASE) or re.search(REVIEW_COUNT_PATTERN, text, re.IGNORECASE))
+
+
+# =====================================================================
 # STEP 4: LEAD SCORE
 # =====================================================================
 
-def calculate_lead_score(has_website, email_found):
+def calculate_lead_score(has_website, email_found, has_phone, has_reviews):
+    """Zyada signals = zyada confident lead ke active/real business hone ka."""
     score = 0
+
     if not has_website:
-        score += 50  # asal signal: website hi nahi hai
+        score += 35  # asal signal: apni website nahi hai
     else:
         score += 5
 
     if email_found and email_found != "Nahi mila":
-        score += 35
+        score += 25  # free-provider email mila = aasani se contact ho sakta hai
 
-    score += 15  # base: social presence active hai, matlab active business hai
+    if has_phone:
+        score += 20  # phone number listed = active/reachable business
+
+    if has_reviews:
+        score += 15  # ratings/reviews mile = active customer base
+
+    score += 5  # base: social page active hai
     return min(score, 100)
 
 
@@ -231,7 +310,7 @@ def get_or_create_sheet():
         sheet.append_row([
             "Platform", "Profile URL", "Business Name", "Niche",
             "City", "Region", "Country", "Email",
-            "Has Own Website", "Lead Score", "Quality",
+            "Has Own Website", "Has Phone", "Has Reviews", "Lead Score", "Quality",
         ])
     return sheet
 
@@ -240,6 +319,23 @@ def get_existing_urls(sheet):
     try:
         rows = sheet.get_all_values()[1:]
         return set(row[1] for row in rows if len(row) > 1)
+    except Exception:
+        return set()
+
+
+def get_existing_business_keys(sheet):
+    """(business_name, city) combos jo already sheet mein hain — taake
+    same business FB + Instagram + LinkedIn teeno se dobara add na ho."""
+    try:
+        rows = sheet.get_all_values()[1:]
+        keys = set()
+        for row in rows:
+            if len(row) > 4:
+                name = row[2].strip().lower()
+                city = row[4].strip().lower()
+                if name:
+                    keys.add((name, city))
+        return keys
     except Exception:
         return set()
 
@@ -255,6 +351,8 @@ def save_lead_to_sheet(sheet, lead):
         lead["country"],
         lead["email"],
         "No" if not lead["has_website"] else "Yes",
+        "Yes" if lead.get("has_phone") else "No",
+        "Yes" if lead.get("has_reviews") else "No",
         lead["score"],
         lead["quality"],
     ])
@@ -268,6 +366,7 @@ def run_once():
     print("📊 Google Sheet se connect ho rahe hain...")
     sheet = get_or_create_sheet()
     existing_urls = get_existing_urls(sheet)
+    existing_business_keys = get_existing_business_keys(sheet)
     print(f"✅ Connected! Sheet mein pehle se {len(existing_urls)} leads hain.\n")
 
     # Har run mein alag combos try karne ke liye shuffle
@@ -296,6 +395,10 @@ def run_once():
             business_name = clean_business_name(lead["title"], platform)
             checked += 1
 
+            business_key = (business_name.strip().lower(), city.strip().lower())
+            if not business_name or business_key in existing_business_keys:
+                continue  # yeh business kisi aur platform se pehle hi add ho chuki hai
+
             website_exists = has_own_website(business_name, city, country)
             time.sleep(1)
 
@@ -306,19 +409,31 @@ def run_once():
             email = find_email(lead)
             time.sleep(1)
 
-            score = calculate_lead_score(website_exists, email)
+            if email == "Nahi mila":
+                # Email nahi mila (ya domain-email nikla jo free-provider
+                # nahi tha) -> yeh lead skip, sheet mein add nahi hogi
+                continue
+
+            combined_text = lead.get("body", "") + " " + lead.get("title", "")
+            phone_found = has_phone_number(combined_text)
+            reviews_found = has_ratings_or_reviews(combined_text)
+
+            score = calculate_lead_score(website_exists, email, phone_found, reviews_found)
             quality = get_quality_label(score)
 
             lead.update({
                 "business_name": business_name,
                 "email": email,
                 "has_website": website_exists,
+                "has_phone": phone_found,
+                "has_reviews": reviews_found,
                 "score": score,
                 "quality": quality,
             })
 
             save_lead_to_sheet(sheet, lead)
             existing_urls.add(lead["profile_url"])
+            existing_business_keys.add(business_key)
             new_leads_count += 1
             if score >= 70:
                 hot_leads_count += 1
