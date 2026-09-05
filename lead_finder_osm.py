@@ -74,8 +74,8 @@ def build_overpass_query(country_code, tag_key, tag_value):
     [out:json][timeout:90];
     area["ISO3166-1"="{country_code}"][admin_level=2]->.searchArea;
     (
-      node["{tag_key}"="{tag_value}"]["email"]["!website"](area.searchArea);
-      way["{tag_key}"="{tag_value}"]["email"]["!website"](area.searchArea);
+      node["{tag_key}"="{tag_value}"][~"^(email|contact:email)$"~"."]["!website"]["!contact:website"](area.searchArea);
+      way["{tag_key}"="{tag_value}"][~"^(email|contact:email)$"~"."]["!website"]["!contact:website"](area.searchArea);
     );
     out tags;
     """
