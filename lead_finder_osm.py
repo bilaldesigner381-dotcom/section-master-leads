@@ -164,6 +164,65 @@ def get_quality_label(score):
     return "🌱 Cold Lead"
 
 
+def get_count_from_result(elements):
+    """'out count;' ek single summary object deta hai jisme 'total' tag
+    hota hai — is tag ko parse karke asal number nikalta hai."""
+    if not elements:
+        return 0
+    tags = elements[0].get("tags", {})
+    return int(tags.get("total", 0))
+
+
+def run_debug_diagnostic():
+    """Ek fixed niche+country (restaurant/Germany) ke liye step-by-step
+    count dikhata hai, taake pata chale masla area resolve na hone ka hai
+    ya filter zyada tight hone ka."""
+    country_code, country_name = "DE", "Germany"
+    tag_key, tag_value = NICHE_TAGS["restaurant"]
+
+    print(f"🔧 DEBUG MODE: restaurant in {country_name}\n")
+
+    # Stage 1: sirf tag + area (koi email/website filter nahi)
+    q1 = f"""
+    [out:json][timeout:90];
+    area["ISO3166-1"="{country_code}"][admin_level=2]->.searchArea;
+    (
+      node["{tag_key}"="{tag_value}"](area.searchArea);
+      way["{tag_key}"="{tag_value}"](area.searchArea);
+    );
+    out count;
+    """
+    c1 = get_count_from_result(run_overpass_query(q1))
+    print(f"   Stage 1 — sirf '{tag_key}={tag_value}' tag + area: {c1} results")
+
+    # Stage 2: + email ya contact:email hona zaroori
+    q2 = f"""
+    [out:json][timeout:90];
+    area["ISO3166-1"="{country_code}"][admin_level=2]->.searchArea;
+    (
+      node["{tag_key}"="{tag_value}"][~"^(email|contact:email)$"~"."](area.searchArea);
+      way["{tag_key}"="{tag_value}"][~"^(email|contact:email)$"~"."](area.searchArea);
+    );
+    out count;
+    """
+    c2 = get_count_from_result(run_overpass_query(q2))
+    print(f"   Stage 2 — + email/contact:email tag hona zaroori: {c2} results")
+
+    # Stage 3: + website aur contact:website dono absent hone chahiye (final filter)
+    q3 = build_overpass_query(country_code, tag_key, tag_value)
+    r3 = run_overpass_query(q3)
+    print(f"   Stage 3 — + website/contact:website absent (final query, actual elements): {len(r3)} results\n")
+
+    if c1 == 0:
+        print("   ➡️  Stage 1 hi 0 hai — matlab AREA resolve nahi ho rahi (country code/admin_level ka masla).")
+    elif c2 == 0:
+        print("   ➡️  Stage 1 mein data hai lekin Stage 2 mein 0 — matlab businesses hain lekin unme email tag bohat rare hai.")
+    elif len(r3) == 0:
+        print("   ➡️  Stage 2 mein data hai lekin Stage 3 mein 0 — matlab jin businesses ka email hai unka website bhi hai.")
+    else:
+        print(f"   ✅ Sab stages mein data mil raha hai — normal run mein bhi milna chahiye.")
+
+
 # =====================================================================
 # STEP 3: GOOGLE SHEETS (same sheet jo lead_finder_webdev.py use karta hai)
 # =====================================================================
@@ -261,4 +320,8 @@ def run_once():
 
 
 if __name__ == "__main__":
-    run_once()
+    import sys
+    if "--debug" in sys.argv:
+        run_debug_diagnostic()
+    else:
+        run_once()
