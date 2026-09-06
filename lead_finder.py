@@ -130,16 +130,43 @@ COMPETITOR_SIGNATURES = [
 ]
 
 
+# Har keyword ka insaan-parhne-laiq naam — email personalization ke liye
+FEATURE_DISPLAY_NAMES = {
+    "faq": "an FAQ section",
+    "testimonial": "customer testimonials",
+    "countdown": "a countdown/promo timer",
+    "sticky-cart": "a sticky add-to-cart bar",
+    "sticky-add-to-cart": "a sticky add-to-cart bar",
+    "logo-carousel": "a trust-badge/logo carousel",
+    "hero-slider": "a hero image slider",
+    "newsletter": "a newsletter signup form",
+    "promo-banner": "a promotional banner",
+}
+
+
 def analyze_feature_gaps(html_content):
     if not html_content:
-        return {"missing_count": 0, "has_competitor": False}
+        return {"missing_count": 0, "has_competitor": False, "missing_features": []}
 
     html_lower = html_content.lower()
     has_competitor = any(sig in html_lower for sig in COMPETITOR_SIGNATURES)
-    present_count = sum(1 for kw in TARGET_FEATURE_KEYWORDS if kw in html_lower)
-    missing_count = len(TARGET_FEATURE_KEYWORDS) - present_count
 
-    return {"missing_count": missing_count, "has_competitor": has_competitor}
+    missing_display_names = []
+    seen = set()
+    for kw in TARGET_FEATURE_KEYWORDS:
+        if kw not in html_lower:
+            display_name = FEATURE_DISPLAY_NAMES.get(kw, kw)
+            if display_name not in seen:
+                missing_display_names.append(display_name)
+                seen.add(display_name)
+
+    missing_count = len(missing_display_names)
+
+    return {
+        "missing_count": missing_count,
+        "has_competitor": has_competitor,
+        "missing_features": missing_display_names,
+    }
 
 
 # ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Size Filter) ----------
@@ -281,7 +308,7 @@ def get_or_create_sheet():
     except gspread.SpreadsheetNotFound:
         spreadsheet = gc.create(SHEET_NAME)
         sheet = spreadsheet.sheet1
-        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Products", "Lead Score", "Quality", "Reason"])
+        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Products", "Missing Features", "Lead Score", "Quality", "Reason"])
     return sheet
 
 
@@ -300,6 +327,7 @@ def save_lead_to_sheet(sheet, lead):
         lead["theme_name"],
         lead["email"],
         lead["product_count"],
+        ", ".join(lead.get("missing_features", [])),
         lead["score"],
         lead["quality"],
         lead["reason"],
@@ -307,6 +335,11 @@ def save_lead_to_sheet(sheet, lead):
 
 
 # ---------- MAIN ----------
+
+TARGET_LEADS_PER_RUN = 12
+MAX_CYCLES = 6          # poori niches list ko max itni baar dobara try karo
+MAX_RESULTS_PER_SEARCH = 15   # har search template se pehle se zyada URLs khinchna
+
 
 def run_once():
     print("📊 Google Sheet se connect ho rahe hain...")
@@ -319,74 +352,88 @@ def run_once():
     skipped_not_default = 0
     skipped_size = 0
     skipped_competitor = 0
+    tried_urls = set()  # is run mein already check ki gayi URLs (pass ho ya fail) — dobara try na ho
 
-    shuffled_niches = niches.copy()
-    random.shuffle(shuffled_niches)
+    cycle = 0
+    while new_leads_count < TARGET_LEADS_PER_RUN and cycle < MAX_CYCLES:
+        cycle += 1
+        print(f"\n========== CYCLE {cycle}/{MAX_CYCLES} (ab tak {new_leads_count}/{TARGET_LEADS_PER_RUN} leads) ==========\n")
 
-    for niche in shuffled_niches:
-        urls = find_store_urls(niche, max_results=10)
-        print(f"   {len(urls)} store URLs mile is niche mein.\n")
-        time.sleep(3)
+        shuffled_niches = niches.copy()
+        random.shuffle(shuffled_niches)
 
-        for url in urls:
-            if url in existing_urls:
-                continue
+        for niche in shuffled_niches:
+            if new_leads_count >= TARGET_LEADS_PER_RUN:
+                break
 
-            result = check_store(url)
-            time.sleep(1)
+            urls = find_store_urls(niche, max_results=MAX_RESULTS_PER_SEARCH)
+            print(f"   {len(urls)} store URLs mile is niche mein.\n")
+            time.sleep(3)
 
-            if result is None:
-                continue
+            for url in urls:
+                if new_leads_count >= TARGET_LEADS_PER_RUN:
+                    break
+                if url in existing_urls or url in tried_urls:
+                    continue
+                tried_urls.add(url)
 
-            # FILTER 1: sirf default/free theme wali stores chahiye
-            if not result["is_lead"]:
-                skipped_not_default += 1
-                continue
+                result = check_store(url)
+                time.sleep(1)
 
-            # FILTER 2: size ka sweet spot — bohat chhoti ya bohat bari nahi
-            product_count = get_product_count(url)
-            time.sleep(1)
-            if product_count is None or product_count < MIN_PRODUCTS or product_count > MAX_PRODUCTS:
-                skipped_size += 1
-                continue
+                if result is None:
+                    continue
 
-            # FILTER 3: agar pehle se koi competing page-builder app use ho
-            # raha hai, to unka masla already solve ho chuka hai — skip
-            gap_info = analyze_feature_gaps(result.get("homepage_html"))
-            if gap_info["has_competitor"]:
-                skipped_competitor += 1
-                continue
+                if not result["is_lead"]:
+                    skipped_not_default += 1
+                    continue
 
-            missing_count = gap_info["missing_count"]
+                product_count = get_product_count(url)
+                time.sleep(1)
+                if product_count is None or product_count < MIN_PRODUCTS or product_count > MAX_PRODUCTS:
+                    skipped_size += 1
+                    continue
 
-            result["niche"] = niche
-            result["reason"] = (
-                f"Default '{result['schema_name']}' theme, {product_count} products, "
-                f"missing {missing_count}/{len(TARGET_FEATURE_KEYWORDS)} target features "
-                f"(FAQ/testimonials/sticky-cart/etc.) — strong Section Master fit"
-            )
+                gap_info = analyze_feature_gaps(result.get("homepage_html"))
+                if gap_info["has_competitor"]:
+                    skipped_competitor += 1
+                    continue
 
-            email = find_email(url)
-            time.sleep(1)
+                missing_count = gap_info["missing_count"]
+                result["missing_features"] = gap_info["missing_features"]
 
-            result["email"] = email
-            result["product_count"] = product_count
+                result["niche"] = niche
+                result["reason"] = (
+                    f"Default '{result['schema_name']}' theme, {product_count} products, "
+                    f"missing {missing_count}/{len(TARGET_FEATURE_KEYWORDS)} target features "
+                    f"(FAQ/testimonials/sticky-cart/etc.) — strong Section Master fit"
+                )
 
-            score = calculate_lead_score(product_count, email, missing_count)
-            result["score"] = score
-            result["quality"] = get_quality_label(score)
+                email = find_email(url)
+                time.sleep(1)
 
-            save_lead_to_sheet(sheet, result)
-            existing_urls.add(url)
-            new_leads_count += 1
-            if score >= 70:
-                hot_leads_count += 1
+                result["email"] = email
+                result["product_count"] = product_count
 
-            print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
+                score = calculate_lead_score(product_count, email, missing_count)
+                result["score"] = score
+                result["quality"] = get_quality_label(score)
+
+                save_lead_to_sheet(sheet, result)
+                existing_urls.add(url)
+                new_leads_count += 1
+                if score >= 70:
+                    hot_leads_count += 1
+
+                print(f"   [{new_leads_count}/{TARGET_LEADS_PER_RUN}] {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
 
     print(f"\n===== DONE =====")
     print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!")
-    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)\n")
+    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)")
+
+    if new_leads_count < TARGET_LEADS_PER_RUN:
+        print(f"\n⚠️  Target {TARGET_LEADS_PER_RUN} tak nahi pahunch saka (sirf {new_leads_count} mile). Isका matlab:")
+        print("    - Is niche list mein itni fresh (pehle se sheet mein na hoin) qualifying stores nahi bachin, ya")
+        print("    - Filters bohat tight hain is volume ke liye — niches list barhayein ya MIN/MAX_PRODUCTS thoda relax karein.\n")
 
 
 if __name__ == "__main__":
