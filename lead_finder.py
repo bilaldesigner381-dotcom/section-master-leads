@@ -1,4 +1,5 @@
 import requests
+from collections import defaultdict
 import re
 import time
 import random
@@ -50,6 +51,16 @@ BLOCKED_DOMAINS = [
 
 SHEET_NAME = "Section Master Leads"
 
+# Default 'python-requests/x.x' User-Agent bohat sari Cloudflare/Shopify
+# protected sites turant bot samajh kar block kar deti hain (403 ya
+# connection reset). Ek real browser jaisa User-Agent bhejna is masle
+# ko kaafi had tak kam kar deta hai.
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 # ---------- STEP 1: STORE URLs DHOONDNA ----------
 
@@ -86,17 +97,18 @@ def find_store_urls(niche, max_results=10):
 
 def check_store(url):
     try:
-        response = requests.get(url, timeout=10)
-    except requests.exceptions.RequestException:
-        return None
+        response = requests.get(url, timeout=15, headers=DEFAULT_HEADERS)
+    except requests.exceptions.RequestException as e:
+        return None, "network_error"
+
     if response.status_code != 200:
-        return None
+        return None, f"status_{response.status_code}"
 
     html_content = response.text
     schema_match = re.search(r'"schema_name"\s*:\s*"([^"]+)"', html_content)
     name_match = re.search(r'"name"\s*:\s*"([^"]+)"', html_content)
     if not schema_match:
-        return None
+        return None, "no_schema_found"  # page load hui lekin Shopify theme schema nahi mila (false-positive search match)
 
     schema_name = schema_match.group(1)
     theme_name = name_match.group(1) if name_match else "Unknown"
@@ -108,7 +120,7 @@ def check_store(url):
         "schema_name": schema_name,
         "is_lead": is_default,
         "homepage_html": html_content,
-    }
+    }, None
 
 
 # ---------- STEP 2.5: FEATURE-GAP DETECTION (asal Section Master fit check) ----------
@@ -178,7 +190,7 @@ def get_product_count(store_url):
 
     base_url = base_match.group(1)
     try:
-        response = requests.get(f"{base_url}/products.json?limit=250", timeout=10)
+        response = requests.get(f"{base_url}/products.json?limit=250", timeout=15, headers=DEFAULT_HEADERS)
         if response.status_code == 200:
             data = response.json()
             count = len(data.get("products", []))
@@ -224,7 +236,7 @@ def find_email(store_url):
     homepage_html = ""
 
     try:
-        response = requests.get(store_url, timeout=10)
+        response = requests.get(store_url, timeout=15, headers=DEFAULT_HEADERS)
         if response.status_code == 200:
             homepage_html = response.text
             emails_found.extend(extract_emails_from_html(homepage_html))
@@ -244,7 +256,7 @@ def find_email(store_url):
             ]
             for contact_url in contact_urls_to_try:
                 try:
-                    response = requests.get(contact_url, timeout=10)
+                    response = requests.get(contact_url, timeout=15, headers=DEFAULT_HEADERS)
                     if response.status_code == 200:
                         emails_found.extend(extract_emails_from_html(response.text))
                         if emails_found:
@@ -353,13 +365,14 @@ def run_once():
     skipped_size = 0
     skipped_competitor = 0
     skipped_fetch_failed = 0
+    fetch_fail_reasons = defaultdict(int)
     tried_urls = set()  # is run mein already check ki gayi URLs (pass ho ya fail) — dobara try na ho
 
     cycle = 0
     while new_leads_count < TARGET_LEADS_PER_RUN and cycle < MAX_CYCLES:
         cycle += 1
         print(f"\n========== CYCLE {cycle}/{MAX_CYCLES} (ab tak {new_leads_count}/{TARGET_LEADS_PER_RUN} leads) ==========")
-        print(f"   (running totals — fetch-fail: {skipped_fetch_failed}, custom-theme: {skipped_not_default}, size: {skipped_size}, competitor: {skipped_competitor})\n")
+        print(f"   (running totals — fetch-fail: {skipped_fetch_failed} {dict(fetch_fail_reasons)}, custom-theme: {skipped_not_default}, size: {skipped_size}, competitor: {skipped_competitor})\n")
 
         shuffled_niches = niches.copy()
         random.shuffle(shuffled_niches)
@@ -379,11 +392,12 @@ def run_once():
                     continue
                 tried_urls.add(url)
 
-                result = check_store(url)
+                result, fail_reason = check_store(url)
                 time.sleep(1)
 
                 if result is None:
                     skipped_fetch_failed += 1
+                    fetch_fail_reasons[fail_reason] += 1
                     continue
 
                 if not result["is_lead"]:
@@ -431,7 +445,7 @@ def run_once():
 
     print(f"\n===== DONE =====")
     print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!")
-    print(f"Skipped: {skipped_fetch_failed} (fetch/network fail), {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)")
+    print(f"Skipped: {skipped_fetch_failed} (fetch/network fail — breakdown: {dict(fetch_fail_reasons)}), {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)")
 
     if new_leads_count < TARGET_LEADS_PER_RUN:
         print(f"\n⚠️  Target {TARGET_LEADS_PER_RUN} tak nahi pahunch saka (sirf {new_leads_count} mile). Isका matlab:")
