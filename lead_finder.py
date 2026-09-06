@@ -352,12 +352,14 @@ def run_once():
     skipped_not_default = 0
     skipped_size = 0
     skipped_competitor = 0
+    skipped_fetch_failed = 0
     tried_urls = set()  # is run mein already check ki gayi URLs (pass ho ya fail) — dobara try na ho
 
     cycle = 0
     while new_leads_count < TARGET_LEADS_PER_RUN and cycle < MAX_CYCLES:
         cycle += 1
-        print(f"\n========== CYCLE {cycle}/{MAX_CYCLES} (ab tak {new_leads_count}/{TARGET_LEADS_PER_RUN} leads) ==========\n")
+        print(f"\n========== CYCLE {cycle}/{MAX_CYCLES} (ab tak {new_leads_count}/{TARGET_LEADS_PER_RUN} leads) ==========")
+        print(f"   (running totals — fetch-fail: {skipped_fetch_failed}, custom-theme: {skipped_not_default}, size: {skipped_size}, competitor: {skipped_competitor})\n")
 
         shuffled_niches = niches.copy()
         random.shuffle(shuffled_niches)
@@ -381,6 +383,7 @@ def run_once():
                 time.sleep(1)
 
                 if result is None:
+                    skipped_fetch_failed += 1
                     continue
 
                 if not result["is_lead"]:
@@ -428,7 +431,7 @@ def run_once():
 
     print(f"\n===== DONE =====")
     print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!")
-    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)")
+    print(f"Skipped: {skipped_fetch_failed} (fetch/network fail), {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)")
 
     if new_leads_count < TARGET_LEADS_PER_RUN:
         print(f"\n⚠️  Target {TARGET_LEADS_PER_RUN} tak nahi pahunch saka (sirf {new_leads_count} mile). Isका matlab:")
