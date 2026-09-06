@@ -107,7 +107,39 @@ def check_store(url):
         "theme_name": theme_name,
         "schema_name": schema_name,
         "is_lead": is_default,
+        "homepage_html": html_content,
     }
+
+
+# ---------- STEP 2.5: FEATURE-GAP DETECTION (asal Section Master fit check) ----------
+
+# Section Master jo features deta hai unke common HTML/CSS signatures.
+# Agar store ki homepage mein yeh keywords bilkul nahi milte, matlab
+# unke paas yeh feature hi nahi hai — strong signal ke unhe app chahiye.
+TARGET_FEATURE_KEYWORDS = [
+    "faq", "testimonial", "countdown", "sticky-cart", "sticky-add-to-cart",
+    "logo-carousel", "hero-slider", "newsletter", "promo-banner",
+]
+
+# Agar store pehle se in competing section-builder/page-builder apps
+# mein se koi use kar raha hai, to unka masla already solve ho chuka
+# hai — is lead ko skip karna behtar hai.
+COMPETITOR_SIGNATURES = [
+    "pagefly", "gempages", "shogun", "zipify", "ecomposer",
+    "vitals-cdn", "pagebuilder-shopify", "shogunpagebuilder",
+]
+
+
+def analyze_feature_gaps(html_content):
+    if not html_content:
+        return {"missing_count": 0, "has_competitor": False}
+
+    html_lower = html_content.lower()
+    has_competitor = any(sig in html_lower for sig in COMPETITOR_SIGNATURES)
+    present_count = sum(1 for kw in TARGET_FEATURE_KEYWORDS if kw in html_lower)
+    missing_count = len(TARGET_FEATURE_KEYWORDS) - present_count
+
+    return {"missing_count": missing_count, "has_competitor": has_competitor}
 
 
 # ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Size Filter) ----------
@@ -206,17 +238,20 @@ def find_email(store_url):
 
 # ---------- STEP 5: LEAD SCORE CALCULATE KARNA ----------
 
-def calculate_lead_score(product_count, email_found):
-    """Ab sirf default-theme stores hi yahan tak pahunchti hain, isliye
-    theme wala factor hata diya — ab size aur contactability pe focus hai."""
-    score = 40  # base: confirmed default theme
+def calculate_lead_score(product_count, email_found, missing_feature_count):
+    """Ab feature-gap (kitne Section Master jaisi cheezein missing hain)
+    sabse bara signal hai — jitni zyada missing utni behtar lead."""
+    score = 20  # base: confirmed default theme
+
+    gap_ratio = missing_feature_count / len(TARGET_FEATURE_KEYWORDS)
+    score += round(gap_ratio * 35)  # up to 35 pts agar sab features missing hon
 
     if product_count >= 15:
-        score += 35  # active, real inventory wali store
-    elif product_count >= 3:
         score += 20
+    elif product_count >= 3:
+        score += 10
     else:
-        score += 5
+        score += 3
 
     if email_found and email_found != "Nahi mila" and not email_found.startswith("Facebook"):
         score += 25
@@ -283,6 +318,7 @@ def run_once():
     hot_leads_count = 0
     skipped_not_default = 0
     skipped_size = 0
+    skipped_competitor = 0
 
     shuffled_niches = niches.copy()
     random.shuffle(shuffled_niches)
@@ -314,8 +350,21 @@ def run_once():
                 skipped_size += 1
                 continue
 
+            # FILTER 3: agar pehle se koi competing page-builder app use ho
+            # raha hai, to unka masla already solve ho chuka hai — skip
+            gap_info = analyze_feature_gaps(result.get("homepage_html"))
+            if gap_info["has_competitor"]:
+                skipped_competitor += 1
+                continue
+
+            missing_count = gap_info["missing_count"]
+
             result["niche"] = niche
-            result["reason"] = f"Default '{result['schema_name']}' theme, {product_count} products — customization ki zaroorat hai"
+            result["reason"] = (
+                f"Default '{result['schema_name']}' theme, {product_count} products, "
+                f"missing {missing_count}/{len(TARGET_FEATURE_KEYWORDS)} target features "
+                f"(FAQ/testimonials/sticky-cart/etc.) — strong Section Master fit"
+            )
 
             email = find_email(url)
             time.sleep(1)
@@ -323,7 +372,7 @@ def run_once():
             result["email"] = email
             result["product_count"] = product_count
 
-            score = calculate_lead_score(product_count, email)
+            score = calculate_lead_score(product_count, email, missing_count)
             result["score"] = score
             result["quality"] = get_quality_label(score)
 
@@ -337,7 +386,7 @@ def run_once():
 
     print(f"\n===== DONE =====")
     print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!")
-    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar)\n")
+    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar), {skipped_competitor} (already competitor app use kar rahe)\n")
 
 
 if __name__ == "__main__":
