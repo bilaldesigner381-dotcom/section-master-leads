@@ -17,7 +17,20 @@ niches = [
     "gaming accessories", "electronics", "stationery", "plants", "swimwear",
 ]
 
-default_theme_names = ["dawn", "debut", "craft", "sense", "refresh", "taste", "studio", "ride"]
+# Shopify ke current + legacy FREE default themes. Agar koi store inme se
+# kisi ek ka schema use kar raha hai, matlab unhone koi paid/custom theme
+# lagane mein invest nahi kiya — yeh humari asal target hai.
+default_theme_names = [
+    "dawn", "craft", "sense", "refresh", "taste", "studio", "ride",
+    "colorblock", "origin", "debut",
+]
+
+# Size filter: bohat chhoti (test/empty) store aur bohat bari (already
+# established, apna dev resource rakhne wali) store dono exclude karni
+# hain. Sweet spot: chhoti-medium active stores jo abhi bhi free theme
+# pe hain — yeh sabse zyada convert hone wala segment hai.
+MIN_PRODUCTS = 3
+MAX_PRODUCTS = 60
 
 SEARCH_TEMPLATES = [
     '"powered by shopify" {niche} store',
@@ -43,7 +56,7 @@ SHEET_NAME = "Section Master Leads"
 def find_store_urls(niche, max_results=10):
     all_urls = []
     templates = SEARCH_TEMPLATES.copy()
-    random.shuffle(templates)  # har run mein order badalta rahe, taake alag results milein
+    random.shuffle(templates)
 
     for template in templates:
         query = template.format(niche=niche)
@@ -97,10 +110,9 @@ def check_store(url):
     }
 
 
-# ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Quality Signal) ----------
+# ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Size Filter) ----------
 
 def get_product_count(store_url):
-    """Store ke actual products count karta hai - zyada products = zyada serious/active store"""
     base_match = re.match(r'(https?://[^/]+)', store_url)
     if not base_match:
         return None
@@ -192,27 +204,22 @@ def find_email(store_url):
     return "Nahi mila"
 
 
-# ---------- STEP 5: LEAD SCORE CALCULATE KARNA (Fun Factor!) ----------
+# ---------- STEP 5: LEAD SCORE CALCULATE KARNA ----------
 
-def calculate_lead_score(is_default_theme, product_count, email_found):
-    """0-100 ka score deta hai - jitna zyada, utni behtar lead"""
-    score = 0
+def calculate_lead_score(product_count, email_found):
+    """Ab sirf default-theme stores hi yahan tak pahunchti hain, isliye
+    theme wala factor hata diya — ab size aur contactability pe focus hai."""
+    score = 40  # base: confirmed default theme
 
-    if is_default_theme:
-        score += 40  # default theme = customization ki zaroorat, high priority
+    if product_count >= 15:
+        score += 35  # active, real inventory wali store
+    elif product_count >= 3:
+        score += 20
     else:
-        score += 10  # custom theme hai, phir bhi potential lead, kam priority
-
-    if product_count is not None:
-        if product_count >= 20:
-            score += 35  # bohat products = serious/active business
-        elif product_count >= 5:
-            score += 20
-        else:
-            score += 5  # bohat kam products, shayad naya/inactive store
+        score += 5
 
     if email_found and email_found != "Nahi mila" and not email_found.startswith("Facebook"):
-        score += 25  # direct email mila = aasani se contact ho sakta hai
+        score += 25
 
     return min(score, 100)
 
@@ -257,7 +264,7 @@ def save_lead_to_sheet(sheet, lead):
         lead["niche"],
         lead["theme_name"],
         lead["email"],
-        lead["product_count"] if lead["product_count"] is not None else "N/A",
+        lead["product_count"],
         lead["score"],
         lead["quality"],
         lead["reason"],
@@ -274,8 +281,9 @@ def run_once():
 
     new_leads_count = 0
     hot_leads_count = 0
+    skipped_not_default = 0
+    skipped_size = 0
 
-    # Niches ko shuffle karna, taake har run mein alag order se coverage mile
     shuffled_niches = niches.copy()
     random.shuffle(shuffled_niches)
 
@@ -294,36 +302,42 @@ def run_once():
             if result is None:
                 continue
 
-            if result is not None:
-                is_default = result["is_lead"]
-                result["niche"] = niche
-                if is_default:
-                    result["reason"] = f"Default '{result['schema_name']}' theme use kar rahe hain — customization ki zaroorat hai"
-                else:
-                    result["reason"] = f"Custom '{result['schema_name']}' theme, lekin phir bhi potential lead"
+            # FILTER 1: sirf default/free theme wali stores chahiye
+            if not result["is_lead"]:
+                skipped_not_default += 1
+                continue
 
-                email = find_email(url)
-                result["email"] = email
-                time.sleep(1)
+            # FILTER 2: size ka sweet spot — bohat chhoti ya bohat bari nahi
+            product_count = get_product_count(url)
+            time.sleep(1)
+            if product_count is None or product_count < MIN_PRODUCTS or product_count > MAX_PRODUCTS:
+                skipped_size += 1
+                continue
 
-                product_count = get_product_count(url)
-                result["product_count"] = product_count
-                time.sleep(1)
+            result["niche"] = niche
+            result["reason"] = f"Default '{result['schema_name']}' theme, {product_count} products — customization ki zaroorat hai"
 
-                score = calculate_lead_score(is_default, product_count, email)
-                result["score"] = score
-                result["quality"] = get_quality_label(score)
+            email = find_email(url)
+            time.sleep(1)
 
-                save_lead_to_sheet(sheet, result)
-                existing_urls.add(url)
-                new_leads_count += 1
-                if score >= 70:
-                    hot_leads_count += 1
+            result["email"] = email
+            result["product_count"] = product_count
 
-                print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
+            score = calculate_lead_score(product_count, email)
+            result["score"] = score
+            result["quality"] = get_quality_label(score)
+
+            save_lead_to_sheet(sheet, result)
+            existing_urls.add(url)
+            new_leads_count += 1
+            if score >= 70:
+                hot_leads_count += 1
+
+            print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
 
     print(f"\n===== DONE =====")
-    print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!\n")
+    print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!")
+    print(f"Skipped: {skipped_not_default} (custom theme), {skipped_size} (size filter se bahar)\n")
 
 
 if __name__ == "__main__":
