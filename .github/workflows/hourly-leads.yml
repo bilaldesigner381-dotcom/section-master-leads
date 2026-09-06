@@ -1,9 +1,8 @@
-name: Lead Finder (Google Search)
+name: Hourly Lead Finder
 on:
   schedule:
-    - cron: '0 */4 * * *'   # har 4 ghante mein chalega (6 baar/din) — Google free quota ke andar rehne ke liye
-  workflow_dispatch:
-
+    - cron: '0 * * * *'   # har ghante chalega
+  workflow_dispatch:        # manual "Run workflow" button ke liye bhi allow karta hai
 jobs:
   find-leads:
     runs-on: ubuntu-latest
@@ -19,9 +18,6 @@ jobs:
       - name: Write Google token file
         run: echo '${{ secrets.TOKEN_JSON }}' > token.json
       - name: Run lead finder script
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_CX: ${{ secrets.GOOGLE_CX }}
         run: python lead_finder.py
       - name: Run email sender script
         env:
