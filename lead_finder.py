@@ -1,12 +1,36 @@
+import os
 import requests
 import re
 import time
 import random
 import gspread
 from google.oauth2.credentials import Credentials
-from ddgs import DDGS
 
 # ---------- SETTINGS ----------
+
+# Google Cloud Console -> "Custom Search API" enable karo -> API key banao
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+# https://programmablesearchengine.google.com -> naya search engine banao
+# -> "Search the entire web" ON karo -> Search Engine ID (cx) copy karo
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
+
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+# Page 6 = results 51-60. Free tier 100 queries/day deta hai,
+# aur har query mein sirf 1 API call lagti hai (num=10, start=51).
+START_POSITION = 51
+RESULTS_PER_QUERY = 10
+
+MAX_QUERIES_PER_RUN = 90  # 100 ki limit se thoda neeche, safety margin ke liye
+
+SHEET_NAME = "Section Master Leads"
+QUERY_STATE_TAB = "QueryState"
+
+# ---------- QUERY POOL (Advanced auto-expanding query generator) ----------
+# AI model call kiye bina, yeh niches x templates x modifiers combine karke
+# 1800+ unique search queries banata hai. Har run mein agle N naye queries
+# (jo pehle try nahi hue) use hote hain, aur position (pointer) Sheet mein
+# save hota hai — taake system khud "yaad" rakhe kahan tak pahoncha tha.
 
 niches = [
     "jewelry", "candles", "fitness", "skincare", "pet supplies",
@@ -17,15 +41,20 @@ niches = [
     "gaming accessories", "electronics", "stationery", "plants", "swimwear",
 ]
 
-default_theme_names = ["dawn", "debut", "craft", "sense", "refresh", "taste", "studio", "ride"]
-
-SEARCH_TEMPLATES = [
+BASE_TEMPLATES = [
     '"powered by shopify" {niche} store',
     '{niche} online store shopify -site:myshopify.com',
     '{niche} shop "add to cart" shopify',
     'buy {niche} online shopify store',
     '{niche} boutique shopify -blog',
 ]
+
+EXTRA_MODIFIERS = [
+    "", "best", "top rated", "new arrivals", "on sale", "discount",
+    "free shipping", "premium", "handmade", "eco friendly", "affordable", "trending",
+]
+
+default_theme_names = ["dawn", "debut", "craft", "sense", "refresh", "taste", "studio", "ride"]
 
 BLOCKED_DOMAINS = [
     "myshopify.com", "shopify.com", "pinterest.com", "facebook.com",
@@ -35,38 +64,95 @@ BLOCKED_DOMAINS = [
     "walmart.com", "target.com", "aliexpress.com",
 ]
 
-SHEET_NAME = "Section Master Leads"
+
+def build_query_pool():
+    """Niches x templates x modifiers combine karke bara pool banata hai.
+    Fixed seed ke saath shuffle karta hai taake har baar same (deterministic)
+    order mile — isse pointer system reliably kaam karta hai."""
+    pool = []
+    for niche in niches:
+        for template in BASE_TEMPLATES:
+            base_query = template.format(niche=niche)
+            for modifier in EXTRA_MODIFIERS:
+                query = f"{base_query} {modifier}".strip()
+                pool.append(query)
+
+    rng = random.Random(42)  # fixed seed -> deterministic order, but "random" lagta hai
+    rng.shuffle(pool)
+    return pool
 
 
-# ---------- STEP 1: STORE URLs DHOONDNA ----------
+QUERY_POOL = build_query_pool()
+print(f"🧠 Query pool ban gaya: {len(QUERY_POOL)} unique queries available.")
 
-def find_store_urls(niche, max_results=10):
-    all_urls = []
-    templates = SEARCH_TEMPLATES.copy()
-    random.shuffle(templates)  # har run mein order badalta rahe, taake alag results milein
 
-    for template in templates:
-        query = template.format(niche=niche)
-        print(f"🔍 Searching: '{query}'")
-        try:
-            results = DDGS().text(query, max_results=max_results)
-        except Exception as e:
-            print(f"   ⚠️  Search fail ho gayi ({e}), skip kar rahe hain")
-            continue
+# ---------- QUERY POINTER (Sheet mein persist hota hai) ----------
 
-        for result in results:
-            url = result.get("href", "")
-            if not url:
-                continue
-            if any(blocked in url.lower() for blocked in BLOCKED_DOMAINS):
-                continue
-            if "/blogs/" in url.lower() or "/blog/" in url.lower():
-                continue
-            all_urls.append(url)
+def get_or_create_state_tab(spreadsheet):
+    try:
+        return spreadsheet.worksheet(QUERY_STATE_TAB)
+    except gspread.WorksheetNotFound:
+        tab = spreadsheet.add_worksheet(title=QUERY_STATE_TAB, rows=2, cols=2)
+        tab.update("A1", [["next_index", "0"]])
+        return tab
 
-        time.sleep(2)
 
-    return list(dict.fromkeys(all_urls))
+def get_next_index(state_tab):
+    try:
+        value = state_tab.acell("B1").value
+        return int(value) if value else 0
+    except Exception:
+        return 0
+
+
+def save_next_index(state_tab, index):
+    state_tab.update("B1", [[str(index)]])
+
+
+def get_next_queries(state_tab, count):
+    """Pool se agle 'count' naye queries deta hai, pointer aage badhata hai.
+    Pool khatam hone par wapas 0 se cycle kar leta hai."""
+    start_index = get_next_index(state_tab)
+    pool_size = len(QUERY_POOL)
+
+    selected = []
+    for i in range(count):
+        idx = (start_index + i) % pool_size
+        selected.append(QUERY_POOL[idx])
+
+    new_index = (start_index + count) % pool_size
+    save_next_index(state_tab, new_index)
+
+    return selected
+
+
+# ---------- STEP 1: GOOGLE PAR SEARCH KARNA (Custom Search API) ----------
+
+def search_google(query):
+    """Position 51-60 (page 6) ka block mangwata hai — 1 hi API call."""
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        print("⚠️  GOOGLE_API_KEY ya GOOGLE_CSE_ID set nahi hai.")
+        return []
+
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "start": START_POSITION,
+        "num": RESULTS_PER_QUERY,
+    }
+
+    try:
+        response = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
+        if response.status_code == 429:
+            print("   ⚠️  Daily quota khatam ho gaya (429), rok rahe hain.")
+            return None  # signal: quota khatam, poora run rok do
+        response.raise_for_status()
+        items = response.json().get("items", [])
+        return [item.get("link", "") for item in items if item.get("link")]
+    except Exception as e:
+        print(f"   ⚠️  Google search fail ho gayi: {e}")
+        return []
 
 
 # ---------- STEP 2: THEME CHECK KARNA ----------
@@ -97,10 +183,9 @@ def check_store(url):
     }
 
 
-# ---------- STEP 3: PRODUCT COUNT CHECK KARNA (Quality Signal) ----------
+# ---------- STEP 3: PRODUCT COUNT CHECK KARNA ----------
 
 def get_product_count(store_url):
-    """Store ke actual products count karta hai - zyada products = zyada serious/active store"""
     base_match = re.match(r'(https?://[^/]+)', store_url)
     if not base_match:
         return None
@@ -192,27 +277,26 @@ def find_email(store_url):
     return "Nahi mila"
 
 
-# ---------- STEP 5: LEAD SCORE CALCULATE KARNA (Fun Factor!) ----------
+# ---------- STEP 5: LEAD SCORE CALCULATE KARNA ----------
 
 def calculate_lead_score(is_default_theme, product_count, email_found):
-    """0-100 ka score deta hai - jitna zyada, utni behtar lead"""
     score = 0
 
     if is_default_theme:
-        score += 40  # default theme = customization ki zaroorat, high priority
+        score += 40
     else:
-        score += 10  # custom theme hai, phir bhi potential lead, kam priority
+        score += 10
 
     if product_count is not None:
         if product_count >= 20:
-            score += 35  # bohat products = serious/active business
+            score += 35
         elif product_count >= 5:
             score += 20
         else:
-            score += 5  # bohat kam products, shayad naya/inactive store
+            score += 5
 
     if email_found and email_found != "Nahi mila" and not email_found.startswith("Facebook"):
-        score += 25  # direct email mila = aasani se contact ho sakta hai
+        score += 25
 
     return min(score, 100)
 
@@ -235,12 +319,15 @@ def get_or_create_sheet():
     creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     gc = gspread.authorize(creds)
     try:
-        sheet = gc.open(SHEET_NAME).sheet1
+        spreadsheet = gc.open(SHEET_NAME)
     except gspread.SpreadsheetNotFound:
         spreadsheet = gc.create(SHEET_NAME)
-        sheet = spreadsheet.sheet1
-        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Products", "Lead Score", "Quality", "Reason"])
-    return sheet
+
+    sheet = spreadsheet.sheet1
+    if not sheet.get_all_values():
+        sheet.append_row(["Store URL", "Niche", "Theme", "Email", "Products", "Lead Score", "Quality", "Reason", "Search Query"])
+
+    return spreadsheet, sheet
 
 
 def get_existing_urls(sheet):
@@ -261,6 +348,7 @@ def save_lead_to_sheet(sheet, lead):
         lead["score"],
         lead["quality"],
         lead["reason"],
+        lead.get("query", "N/A"),
     ])
 
 
@@ -268,23 +356,34 @@ def save_lead_to_sheet(sheet, lead):
 
 def run_once():
     print("📊 Google Sheet se connect ho rahe hain...")
-    sheet = get_or_create_sheet()
+    spreadsheet, sheet = get_or_create_sheet()
+    state_tab = get_or_create_state_tab(spreadsheet)
     existing_urls = get_existing_urls(sheet)
     print(f"✅ Connected! Sheet mein pehle se {len(existing_urls)} leads hain.\n")
+
+    queries = get_next_queries(state_tab, MAX_QUERIES_PER_RUN)
+    print(f"📝 Is run ke liye {len(queries)} naye queries select hue (pool se).\n")
 
     new_leads_count = 0
     hot_leads_count = 0
 
-    # Niches ko shuffle karna, taake har run mein alag order se coverage mile
-    shuffled_niches = niches.copy()
-    random.shuffle(shuffled_niches)
+    for query in queries:
+        print(f"🔍 Searching (page 6): '{query}'")
+        result_urls = search_google(query)
 
-    for niche in shuffled_niches:
-        urls = find_store_urls(niche, max_results=10)
-        print(f"   {len(urls)} store URLs mile is niche mein.\n")
-        time.sleep(3)
+        if result_urls is None:
+            print("🛑 Google quota khatam ho gaya, run yahin rok rahe hain.")
+            break
 
-        for url in urls:
+        filtered_urls = []
+        for url in result_urls:
+            if any(blocked in url.lower() for blocked in BLOCKED_DOMAINS):
+                continue
+            if "/blogs/" in url.lower() or "/blog/" in url.lower():
+                continue
+            filtered_urls.append(url)
+
+        for url in filtered_urls:
             if url in existing_urls:
                 continue
 
@@ -294,33 +393,35 @@ def run_once():
             if result is None:
                 continue
 
-            if result is not None:
-                is_default = result["is_lead"]
-                result["niche"] = niche
-                if is_default:
-                    result["reason"] = f"Default '{result['schema_name']}' theme use kar rahe hain — customization ki zaroorat hai"
-                else:
-                    result["reason"] = f"Custom '{result['schema_name']}' theme, lekin phir bhi potential lead"
+            is_default = result["is_lead"]
+            result["niche"] = "unknown"
+            result["query"] = query
+            if is_default:
+                result["reason"] = f"Default '{result['schema_name']}' theme use kar rahe hain — customization ki zaroorat hai"
+            else:
+                result["reason"] = f"Custom '{result['schema_name']}' theme, lekin phir bhi potential lead"
 
-                email = find_email(url)
-                result["email"] = email
-                time.sleep(1)
+            email = find_email(url)
+            result["email"] = email
+            time.sleep(1)
 
-                product_count = get_product_count(url)
-                result["product_count"] = product_count
-                time.sleep(1)
+            product_count = get_product_count(url)
+            result["product_count"] = product_count
+            time.sleep(1)
 
-                score = calculate_lead_score(is_default, product_count, email)
-                result["score"] = score
-                result["quality"] = get_quality_label(score)
+            score = calculate_lead_score(is_default, product_count, email)
+            result["score"] = score
+            result["quality"] = get_quality_label(score)
 
-                save_lead_to_sheet(sheet, result)
-                existing_urls.add(url)
-                new_leads_count += 1
-                if score >= 70:
-                    hot_leads_count += 1
+            save_lead_to_sheet(sheet, result)
+            existing_urls.add(url)
+            new_leads_count += 1
+            if score >= 70:
+                hot_leads_count += 1
 
-                print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
+            print(f"   {result['quality']} (Score: {score}) — {url} | Products: {product_count} | Email: {email}")
+
+        time.sleep(1)
 
     print(f"\n===== DONE =====")
     print(f"Total {new_leads_count} nayi leads add hui, jisme se {hot_leads_count} 🔥 Hot Leads hain!\n")
