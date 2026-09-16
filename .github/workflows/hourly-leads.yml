@@ -1,7 +1,7 @@
 name: Hourly Lead Finder
 on:
   schedule:
-    - cron: '0 * * * *'   # har ghante chalega
+    - cron: '0 9 * * *'   # roz 1 baar chalega (9:00 AM UTC = 2:00 PM Pakistan time)
   workflow_dispatch:        # manual "Run workflow" button ke liye bhi allow karta hai
 jobs:
   find-leads:
@@ -18,19 +18,7 @@ jobs:
       - name: Write Google token file
         run: echo '${{ secrets.TOKEN_JSON }}' > token.json
       - name: Run lead finder script
-        run: python lead_finder.py
-      - name: Run email sender script
         env:
-          GMAIL_1_ADDRESS: ${{ secrets.GMAIL_1_ADDRESS }}
-          GMAIL_1_APPPASS: ${{ secrets.GMAIL_1_APPPASS }}
-          GMAIL_2_ADDRESS: ${{ secrets.GMAIL_2_ADDRESS }}
-          GMAIL_2_APPPASS: ${{ secrets.GMAIL_2_APPPASS }}
-          GMAIL_3_ADDRESS: ${{ secrets.GMAIL_3_ADDRESS }}
-          GMAIL_3_APPPASS: ${{ secrets.GMAIL_3_APPPASS }}
-          GMAIL_4_ADDRESS: ${{ secrets.GMAIL_4_ADDRESS }}
-          GMAIL_4_APPPASS: ${{ secrets.GMAIL_4_APPPASS }}
-          GMAIL_5_ADDRESS: ${{ secrets.GMAIL_5_ADDRESS }}
-          GMAIL_5_APPPASS: ${{ secrets.GMAIL_5_APPPASS }}
-          GMAIL_6_ADDRESS: ${{ secrets.GMAIL_6_ADDRESS }}
-          GMAIL_6_APPPASS: ${{ secrets.GMAIL_6_APPPASS }}
-        run: python email_sender.py
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+        run: python lead_finder.py
