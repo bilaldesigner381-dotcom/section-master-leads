@@ -1,4 +1,3 @@
-ddgs
 requests
 gspread
 google-auth
