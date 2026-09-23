@@ -1,24 +1,42 @@
-name: Hourly Lead Finder
+name: Daily Shopify Lead Finder
+
 on:
   schedule:
-    - cron: '0 9 * * *'   # roz 1 baar chalega (9:00 AM UTC = 2:00 PM Pakistan time)
-  workflow_dispatch:        # manual "Run workflow" button ke liye bhi allow karta hai
+    # Runs at 06:00 UTC every day (~11 AM Pakistan time). Edit the cron
+    # expression to change the time. GitHub Actions cron times are always UTC.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
 jobs:
-  find-leads:
+  run-lead-finder:
     runs-on: ubuntu-latest
+    timeout-minutes: 120   # safety cap so a stuck run doesn't burn your quota
+
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.11"
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Write Google token file
-        run: echo '${{ secrets.TOKEN_JSON }}' > token.json
-      - name: Run lead finder script
+        run: pip install requests beautifulsoup4 gspread google-auth
+
+      - name: Run lead finder
         env:
+          # These come from your repo's Settings -> Secrets and variables -> Actions
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
-        run: python lead_finder.py
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python shopify_lead_finder.py
+
+      - name: Commit updated lead data back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lead_data/
+          git diff --staged --quiet || git commit -m "Daily lead run: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
