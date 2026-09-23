@@ -36,6 +36,12 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
 
 # ============================================================
 # CONFIG
@@ -45,7 +51,7 @@ except ImportError:
 CC_COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
 CC_NUM_INDEXES_TO_USE = int(os.environ.get("CC_NUM_INDEXES", "2"))      # how many recent crawl snapshots to query
 CC_MAX_PAGES_PER_INDEX = int(os.environ.get("CC_MAX_PAGES", "15"))      # each page ≈ thousands of URLs
-CC_URL_PATTERN = os.environ.get("CC_URL_PATTERN", "*.myshopify.com")
+CC_URL_PATTERN = os.environ.get("CC_URL_PATTERN", "myshopify.com")     # domain to match (no wildcard needed)
 CC_PAGE_WORKERS = int(os.environ.get("CC_PAGE_WORKERS", "6"))
 
 # --- How many NEW candidate domains to actually analyze this run ---
@@ -62,6 +68,22 @@ GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "").strip()
 USE_GOOGLE_CSE = bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
 RESULTS_PER_QUERY = 10
 GOOGLE_DELAY_SECONDS = 0.5
+
+# --- Shopify App Store review scraping (bonus source, store-NAME guesses) ---
+# Review pages only expose the store's display name + country, not a URL,
+# so we scrape names, turn each into 2-4 candidate domains, and let the
+# normal analyze_store() step verify/discard them (no extra code needed).
+DEFAULT_APP_HANDLES = (
+    "judgeme,loox,product-reviews,ali-reviews,vitals,"
+    "klaviyo-email-marketing,privy,smile-io,recart,"
+    "seal-subscriptions,rebuy-personalization,pushowl-web-push"
+)
+APP_STORE_HANDLES = [
+    h.strip() for h in os.environ.get("APP_STORE_HANDLES", DEFAULT_APP_HANDLES).split(",")
+    if h.strip()
+]
+APP_STORE_MAX_PAGES = int(os.environ.get("APP_STORE_MAX_PAGES", "10"))   # pages per app
+APP_STORE_DELAY_SECONDS = float(os.environ.get("APP_STORE_DELAY", "0.4"))
 
 # --- Optional Google Sheets output ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
@@ -147,9 +169,21 @@ def get_recent_cc_indexes(n):
 
 
 def query_cc_index_page(index_id, url_pattern, page):
+    """
+    Uses matchType=domain, which is the documented/reliable way to get a
+    domain + all its subdomains from the CC Index Server. (The "*.domain"
+    wildcard syntax gets url-encoded by requests into %2A and silently
+    matches nothing — that was the bug causing 0 results.)
+    """
     base = f"https://index.commoncrawl.org/{index_id}-index"
+
+    # Strip any leading "*." the user might still pass via env var, since
+    # matchType=domain already implies "this domain + all subdomains".
+    clean_pattern = url_pattern[2:] if url_pattern.startswith("*.") else url_pattern
+
     params = {
-        "url": url_pattern,
+        "url": clean_pattern,
+        "matchType": "domain",
         "output": "json",
         "page": page,
     }
@@ -157,10 +191,21 @@ def query_cc_index_page(index_id, url_pattern, page):
 
     try:
         resp = requests.get(base, params=params, headers=headers, timeout=30)
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.error("CC index request failed (index=%s page=%s): %s", index_id, page, str(e))
+        return set(), False
+
+    if resp.status_code == 404:
+        # Page beyond the last available page — normal end-of-results signal.
         return set(), False
 
     if resp.status_code != 200:
+        # Log the FIRST failure per index in detail so it's debuggable,
+        # instead of silently returning nothing like before.
+        logger.error(
+            "CC index HTTP %s (index=%s page=%s): %s",
+            resp.status_code, index_id, page, resp.text[:300]
+        )
         return set(), False
 
     text = resp.text.strip()
@@ -194,7 +239,22 @@ def discover_via_common_crawl():
 
     logger.info("Using Common Crawl indexes: %s", indexes)
 
-    all_domains = set()
+    # Quick single-page diagnostic BEFORE launching full pagination, so a
+    # broken query fails fast with a clear reason instead of silently
+    # burning through every page.
+    test_domains, test_ok = query_cc_index_page(indexes[0], CC_URL_PATTERN, 0)
+    if not test_ok:
+        logger.error(
+            "Common Crawl diagnostic query returned no usable data. "
+            "Check the error above (rate limit / API change / pattern issue)."
+        )
+    else:
+        logger.info(
+            "Diagnostic check OK: index %s page 0 returned %s domains.",
+            indexes[0], len(test_domains)
+        )
+
+    all_domains = set(test_domains)
 
     for index_id in indexes:
         logger.info("Querying index %s for pattern %s ...", index_id, CC_URL_PATTERN)
@@ -292,6 +352,127 @@ def discover_via_google():
 
     logger.info("Google CSE discovery complete: %s domains", len(domains))
     return domains
+
+
+# ============================================================
+# SHOPIFY APP STORE REVIEW SCRAPING (bonus, name-guess based)
+# ============================================================
+
+def scrape_app_reviews_page(handle, page):
+    """
+    Returns a set of store display names found on one review page.
+    Structure confirmed against apps.shopify.com's review block:
+    div[data-merchant-review] > (meta block, author/location block)
+    """
+    url = f"https://apps.shopify.com/{handle}/reviews"
+    params = {"sort_by": "newest", "page": page}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+        ),
+        "Accept-Language": "en-US;q=0.9",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
+    except requests.RequestException:
+        return set()
+
+    if resp.status_code != 200:
+        return set()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    review_blocks = soup.find_all("div", attrs={"data-merchant-review": True})
+
+    names = set()
+    for block in review_blocks:
+        children = block.find_all("div", recursive=False)
+        if len(children) < 2:
+            continue
+
+        info_block = children[1]
+        author_div = info_block.find("div", class_="tw-text-fg-primary")
+        if not author_div:
+            continue
+
+        name = author_div.get_text(strip=True)
+        if name:
+            names.add(name)
+
+    return names
+
+
+def guess_domains_from_name(name):
+    """
+    Turns a store display name into a handful of plausible domain guesses.
+    These are UNVERIFIED — analyze_store() will fetch each one and only
+    keep it if it's a live, real Shopify store. Wrong guesses are dropped
+    automatically at zero extra cost.
+    """
+    base = re.sub(r"[^a-z0-9\s-]", "", name.lower()).strip()
+    if not base:
+        return set()
+
+    nospace = re.sub(r"\s+", "", base)
+    dashed = re.sub(r"\s+", "-", base).strip("-")
+
+    guesses = set()
+    if nospace:
+        guesses.add(f"{nospace}.myshopify.com")
+        guesses.add(f"{nospace}.com")
+    if dashed and dashed != nospace:
+        guesses.add(f"{dashed}.myshopify.com")
+        guesses.add(f"{dashed}.com")
+
+    return guesses
+
+
+def discover_via_app_store_reviews():
+    if not BS4_AVAILABLE:
+        logger.warning(
+            "beautifulsoup4 not installed — skipping App Store review "
+            "discovery. Run: pip install beautifulsoup4"
+        )
+        return set()
+
+    logger.info(
+        "Scraping Shopify App Store reviews for store names (%s apps)...",
+        len(APP_STORE_HANDLES)
+    )
+
+    all_names = set()
+
+    for handle in APP_STORE_HANDLES:
+        logger.info("App: %s", handle)
+        found_any_on_app = False
+
+        for page in range(1, APP_STORE_MAX_PAGES + 1):
+            names = scrape_app_reviews_page(handle, page)
+
+            if not names:
+                break  # ran out of review pages for this app
+
+            all_names |= names
+            found_any_on_app = True
+            time.sleep(APP_STORE_DELAY_SECONDS)
+
+        if not found_any_on_app:
+            logger.warning("No reviews found for app handle: %s (typo or app removed?)", handle)
+
+    logger.info("App Store reviews: %s unique store names collected", len(all_names))
+
+    candidate_domains = set()
+    for name in all_names:
+        candidate_domains |= guess_domains_from_name(name)
+
+    logger.info(
+        "App Store reviews: %s candidate domains generated (unverified guesses, "
+        "will be filtered during analysis)",
+        len(candidate_domains)
+    )
+
+    return candidate_domains
 
 
 # ============================================================
@@ -668,9 +849,14 @@ def main():
     # --------------------------------------------------------
     cc_domains = discover_via_common_crawl()
     google_domains = discover_via_google()
+    app_store_domains = discover_via_app_store_reviews()
 
-    all_discovered = cc_domains | google_domains
-    logger.info("Total discovered (before dedupe against history): %s", len(all_discovered))
+    all_discovered = cc_domains | google_domains | app_store_domains
+    logger.info(
+        "Discovery breakdown -> Common Crawl: %s | Google CSE: %s | "
+        "App Store name-guesses: %s | Combined unique: %s",
+        len(cc_domains), len(google_domains), len(app_store_domains), len(all_discovered)
+    )
 
     new_domains = [d for d in all_discovered if d not in seen_domains and not is_bad_domain(d)]
     logger.info("New unseen candidate domains: %s", len(new_domains))
