@@ -90,12 +90,17 @@ CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "50"))
 
 # --- Optional Google Sheets output ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+# If set, a newly auto-created sheet is shared with this address as Editor
+# so it shows up in your own Google Drive (a service account's own sheets
+# are invisible to you otherwise).
+GOOGLE_SHARE_WITH_EMAIL = os.environ.get("GOOGLE_SHARE_WITH_EMAIL", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Leads").strip()
 
 # --- Local persistent files (always used, zero config needed) ---
 DATA_DIR = os.environ.get("LEAD_DATA_DIR", "./lead_data")
 SEEN_DOMAINS_FILE = os.path.join(DATA_DIR, "seen_domains.json")
+CREATED_SHEET_ID_FILE = os.path.join(DATA_DIR, "created_sheet_id.txt")
 LEADS_CSV_FILE = os.path.join(DATA_DIR, "leads.csv")
 
 
@@ -868,6 +873,62 @@ HEADERS = [
 ]
 
 
+def load_created_sheet_id():
+    """A sheet auto-created on a previous run — reuse it so we don't spin
+    up a brand new spreadsheet every single day."""
+    if not os.path.exists(CREATED_SHEET_ID_FILE):
+        return ""
+    try:
+        with open(CREATED_SHEET_ID_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def save_created_sheet_id(sheet_id):
+    ensure_data_dir()
+    try:
+        with open(CREATED_SHEET_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(sheet_id)
+    except Exception as e:
+        logger.error("Could not save created_sheet_id.txt: %s", str(e))
+
+
+def create_new_sheet(client):
+    logger.info("Creating a brand new Google Sheet for leads...")
+
+    spreadsheet = client.create("Shopify Leads")
+
+    if GOOGLE_SHARE_WITH_EMAIL:
+        try:
+            spreadsheet.share(GOOGLE_SHARE_WITH_EMAIL, perm_type="user", role="writer")
+            logger.info("Shared new sheet with: %s", GOOGLE_SHARE_WITH_EMAIL)
+        except Exception as e:
+            logger.error(
+                "Could not share the new sheet with %s: %s — it still exists "
+                "but only the service account can see it until you share it "
+                "manually from the service account's Drive, or set "
+                "GOOGLE_SHARE_WITH_EMAIL and rerun.",
+                GOOGLE_SHARE_WITH_EMAIL, str(e)
+            )
+    else:
+        logger.warning(
+            "GOOGLE_SHARE_WITH_EMAIL is not set — the new sheet was created "
+            "but is only visible to the service account, not to you. Set "
+            "GOOGLE_SHARE_WITH_EMAIL=<your-gmail-address> as a secret and "
+            "rerun so it gets shared automatically."
+        )
+
+    save_created_sheet_id(spreadsheet.id)
+
+    logger.info("=" * 70)
+    logger.info("NEW GOOGLE SHEET CREATED")
+    logger.info("URL: %s", spreadsheet.url)
+    logger.info("=" * 70)
+
+    return spreadsheet
+
+
 def connect_sheet():
     if not GSPREAD_AVAILABLE:
         logger.warning(
@@ -883,13 +944,6 @@ def connect_sheet():
         )
         return None
 
-    if not GOOGLE_SHEET_ID:
-        logger.warning(
-            "Google Sheet output skipped: GOOGLE_SHEET_ID env var is not set. "
-            "Leads will still be saved to the local CSV."
-        )
-        return None
-
     try:
         service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         scopes = [
@@ -898,13 +952,33 @@ def connect_sheet():
         ]
         credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+
+        # Priority: explicit GOOGLE_SHEET_ID env var -> a sheet we already
+        # auto-created on a previous run -> create a brand new one.
+        sheet_id = GOOGLE_SHEET_ID or load_created_sheet_id()
+
+        spreadsheet = None
+        if sheet_id:
+            try:
+                spreadsheet = client.open_by_key(sheet_id)
+                logger.info("Connected to existing Google Sheet successfully.")
+            except Exception as e:
+                logger.warning(
+                    "Could not open sheet ID %s (%s) — creating a new one instead.",
+                    sheet_id, str(e)
+                )
+                spreadsheet = None
+
+        if spreadsheet is None:
+            spreadsheet = create_new_sheet(client)
+
         try:
             worksheet = spreadsheet.worksheet(SHEET_NAME)
         except Exception:
             worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADERS))
-        logger.info("Connected to Google Sheet successfully.")
+
         return worksheet
+
     except json.JSONDecodeError:
         logger.error(
             "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the full "
@@ -913,10 +987,10 @@ def connect_sheet():
         return None
     except Exception as e:
         logger.error(
-            "Google Sheet connection failed: %s | Common causes: (1) the "
-            "sheet wasn't shared with the service account's client_email as "
-            "Editor, (2) wrong GOOGLE_SHEET_ID, (3) Sheets/Drive API not "
-            "enabled on that Google Cloud project.",
+            "Google Sheet connection failed: %s | Common causes: (1) Sheets/"
+            "Drive API not enabled on that Google Cloud project, (2) the "
+            "service account has no Drive storage quota (rare, but happens "
+            "on some restricted accounts).",
             str(e)
         )
         return None
