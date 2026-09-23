@@ -603,16 +603,62 @@ def extract_emails(text):
     return cleaned
 
 
+MAILTO_REGEX = re.compile(r'mailto:([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})', re.I)
+
+
+def extract_mailto_emails(html):
+    """
+    mailto: links are near-certain to be a real contact email (vs random
+    strings from analytics/CDN scripts that trip up a plain regex scan),
+    so we check these first and trust them most.
+    """
+    if not html:
+        return []
+
+    matches = MAILTO_REGEX.findall(html)
+    cleaned = []
+    for email in matches:
+        email = email.lower().strip()
+        if email not in cleaned:
+            cleaned.append(email)
+    return cleaned
+
+
 def find_email(base_url, homepage_html):
+    # 1) Check homepage for mailto: links first — highest confidence source.
+    mailto_hits = extract_mailto_emails(homepage_html)
+    if mailto_hits:
+        return mailto_hits[0]
+
     all_text = homepage_html
-    pages = ["/contact", "/pages/contact", "/about", "/pages/about"]
+
+    # Shopify stores commonly expose a real business email on the contact
+    # page or on the auto-generated legal policy pages (merchants are
+    # required to provide one there for compliance reasons).
+    pages = [
+        "/contact",
+        "/pages/contact",
+        "/pages/contact-us",
+        "/about",
+        "/pages/about",
+        "/policies/contact-information",
+        "/policies/privacy-policy",
+        "/policies/refund-policy",
+        "/policies/terms-of-service",
+    ]
+
     for path in pages:
         try:
             html, _ = fetch_page(base_url.rstrip("/") + path)
             if html:
+                mailto_hits = extract_mailto_emails(html)
+                if mailto_hits:
+                    return mailto_hits[0]
                 all_text += "\n" + html
         except Exception:
             pass
+
+    # 2) Fall back to a plain-text scan across everything we fetched.
     emails = extract_emails(all_text)
     return emails[0] if emails else ""
 
@@ -786,9 +832,26 @@ HEADERS = [
 
 def connect_sheet():
     if not GSPREAD_AVAILABLE:
+        logger.warning(
+            "Google Sheet output skipped: gspread/google-auth not installed. "
+            "Run: pip install gspread google-auth"
+        )
         return None
-    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
+
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        logger.warning(
+            "Google Sheet output skipped: GOOGLE_SERVICE_ACCOUNT_JSON env var "
+            "is not set. Leads will still be saved to the local CSV."
+        )
         return None
+
+    if not GOOGLE_SHEET_ID:
+        logger.warning(
+            "Google Sheet output skipped: GOOGLE_SHEET_ID env var is not set. "
+            "Leads will still be saved to the local CSV."
+        )
+        return None
+
     try:
         service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         scopes = [
@@ -802,9 +865,22 @@ def connect_sheet():
             worksheet = spreadsheet.worksheet(SHEET_NAME)
         except Exception:
             worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADERS))
+        logger.info("Connected to Google Sheet successfully.")
         return worksheet
+    except json.JSONDecodeError:
+        logger.error(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the full "
+            "contents of the service account key file, not a file path."
+        )
+        return None
     except Exception as e:
-        logger.error("Google Sheet connection failed: %s", str(e))
+        logger.error(
+            "Google Sheet connection failed: %s | Common causes: (1) the "
+            "sheet wasn't shared with the service account's client_email as "
+            "Editor, (2) wrong GOOGLE_SHEET_ID, (3) Sheets/Drive API not "
+            "enabled on that Google Cloud project.",
+            str(e)
+        )
         return None
 
 
@@ -870,10 +946,29 @@ def main():
     logger.info("Analyzing %s candidates this run (cap: %s)", len(candidates), MAX_DOMAINS_PER_RUN)
 
     # --------------------------------------------------------
+    # CONNECT TO SHEET ONCE, UP FRONT — not just at the very end.
+    # This was the bug causing "sheet not created": the old code only
+    # tried to save to Sheets after the full analysis loop finished, using
+    # only whatever leads were left over after the last 200-checkpoint.
+    # If the count landed exactly on a multiple of 200, Sheets never got
+    # called at all. Now we connect once and write to BOTH CSV and Sheet
+    # at every checkpoint.
+    # --------------------------------------------------------
+    worksheet = connect_sheet()
+    if worksheet:
+        setup_headers(worksheet)
+    else:
+        logger.info(
+            "Continuing with CSV-only output this run — leads will be in %s",
+            LEADS_CSV_FILE
+        )
+
+    # --------------------------------------------------------
     # ANALYSIS
     # --------------------------------------------------------
     leads = []
     processed_domains = set()
+    total_leads_found = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
@@ -891,6 +986,7 @@ def main():
                 lead = future.result()
                 if lead:
                     leads.append(lead)
+                    total_leads_found += 1
                     logger.info(
                         "[%s/%s] LEAD: %s | %s | Score %s",
                         completed, len(candidates),
@@ -902,12 +998,17 @@ def main():
             if completed % 200 == 0:
                 seen_domains |= processed_domains
                 save_seen_domains(seen_domains)
-                append_leads_csv(leads)
-                leads = []
+
+                if leads:
+                    append_leads_csv(leads)
+                    if worksheet:
+                        save_leads_to_sheet(worksheet, leads)
+                    leads = []
+
                 logger.info("Checkpoint saved at %s processed.", completed)
 
     # --------------------------------------------------------
-    # FINAL SAVE
+    # FINAL SAVE (whatever is left since the last checkpoint)
     # --------------------------------------------------------
     seen_domains |= processed_domains
     save_seen_domains(seen_domains)
@@ -915,18 +1016,16 @@ def main():
     if leads:
         leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
         append_leads_csv(leads)
-
-        worksheet = connect_sheet()
         if worksheet:
-            setup_headers(worksheet)
             save_leads_to_sheet(worksheet, leads)
-        else:
-            logger.info("Google Sheet not configured — leads are in %s", LEADS_CSV_FILE)
 
     logger.info("=" * 70)
     logger.info("RUN COMPLETE")
     logger.info("Candidates analyzed: %s", len(candidates))
+    logger.info("Total leads found this run: %s", total_leads_found)
     logger.info("All leads this run saved to: %s", LEADS_CSV_FILE)
+    if worksheet:
+        logger.info("Leads also saved to Google Sheet: %s", SHEET_NAME)
     logger.info("=" * 70)
 
 
