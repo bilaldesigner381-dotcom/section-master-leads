@@ -1,42 +1,77 @@
+"""
+SHOPIFY LEAD INTELLIGENCE ENGINE — FREE / HIGH-VOLUME VERSION
+================================================================
+Discovery is powered by Common Crawl (https://commoncrawl.org), a public,
+free, unlimited dataset of internet crawls. No API key, no daily quota.
+We query it for URLs under *.myshopify.com, which are guaranteed-real
+Shopify stores. A single Common Crawl index page can return 10,000+ URLs,
+so a handful of pages easily gives you thousands of unique candidate
+domains per run — something Google CSE's 100/day free quota can never do.
+
+Google Custom Search (if you have keys) is kept as an OPTIONAL bonus
+source layered on top — not required.
+
+Output:
+  - Always writes to a local CSV (works with zero configuration)
+  - Also writes to Google Sheets IF you set the Sheets env vars
+
+Run:  python shopify_lead_finder.py
+"""
+
 import os
 import re
+import csv
 import time
 import json
 import logging
 import requests
-import gspread
 
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from google.oauth2.service_account import Credentials
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
+# --- Common Crawl discovery settings ---
+CC_COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
+CC_NUM_INDEXES_TO_USE = int(os.environ.get("CC_NUM_INDEXES", "2"))      # how many recent crawl snapshots to query
+CC_MAX_PAGES_PER_INDEX = int(os.environ.get("CC_MAX_PAGES", "15"))      # each page ≈ thousands of URLs
+CC_URL_PATTERN = os.environ.get("CC_URL_PATTERN", "*.myshopify.com")
+CC_PAGE_WORKERS = int(os.environ.get("CC_PAGE_WORKERS", "6"))
+
+# --- How many NEW candidate domains to actually analyze this run ---
+MAX_DOMAINS_PER_RUN = int(os.environ.get("MAX_DOMAINS_PER_RUN", "3000"))
+
+# --- Analysis concurrency ---
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
+REQUEST_TIMEOUT = 12
+
+# --- Optional Google CSE (bonus source, not required) ---
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
-
-RESULTS_PER_QUERY = 10
-MAX_QUERIES_PER_RUN = 90
-MAX_WORKERS = 12
-
-REQUEST_TIMEOUT = 15
-GOOGLE_TIMEOUT = 30
-
-# Do not hammer Google
-GOOGLE_DELAY_SECONDS = 0.5
-
-# Environment variables / GitHub Secrets
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
 GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "").strip()
+USE_GOOGLE_CSE = bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
+RESULTS_PER_QUERY = 10
+GOOGLE_DELAY_SECONDS = 0.5
 
+# --- Optional Google Sheets output ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get(
-    "GOOGLE_SERVICE_ACCOUNT_JSON", ""
-).strip()
-
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Leads").strip()
+
+# --- Local persistent files (always used, zero config needed) ---
+DATA_DIR = os.environ.get("LEAD_DATA_DIR", "./lead_data")
+SEEN_DOMAINS_FILE = os.path.join(DATA_DIR, "seen_domains.json")
+LEADS_CSV_FILE = os.path.join(DATA_DIR, "leads.csv")
 
 
 # ============================================================
@@ -47,146 +82,171 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger("shopify-lead-finder")
 
 
 # ============================================================
-# QUERY POOL
+# LOCAL PERSISTENCE (dedupe across daily runs, works with no setup)
 # ============================================================
 
-NICHES = [
-    "bags",
-    "shoes",
-    "fashion",
-    "clothing",
-    "jewelry",
-    "watches",
-    "beauty",
-    "skincare",
-    "cosmetics",
-    "supplements",
-    "fitness",
-    "gym",
-    "sports",
-    "pet products",
-    "home decor",
-    "furniture",
-    "kitchen",
-    "baby products",
-    "organic products",
-    "coffee",
-    "tea",
-    "food",
-    "accessories",
-    "electronics",
-    "gadgets",
-    "candles",
-    "gifts",
-    "handmade products",
-    "streetwear",
-    "activewear",
-    "swimwear",
-    "mens fashion",
-    "womens fashion",
-]
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-TEMPLATES = [
-    "new arrivals",
-    "best sellers",
-    "shop now",
-    "collections",
-    "sale",
-    "featured collection",
-    "featured products",
-    "product collection",
-    "our products",
-    "online store",
-    "buy online",
-    "free shipping",
-    "limited edition",
-    "summer collection",
-    "winter collection",
-    "new collection",
-    "gift collection",
-    "shop collection",
-    "product details",
-    "add to cart",
-]
 
-MODIFIERS = [
-    "Shopify",
-    "shop",
-    "store",
-    "official",
-    "online",
-    "brand",
-]
+def load_seen_domains():
+    ensure_data_dir()
+    if not os.path.exists(SEEN_DOMAINS_FILE):
+        return set()
+    try:
+        with open(SEEN_DOMAINS_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_seen_domains(domains):
+    ensure_data_dir()
+    try:
+        with open(SEEN_DOMAINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(domains), f)
+    except Exception as e:
+        logger.error("Could not save seen_domains.json: %s", str(e))
+
+
+def append_leads_csv(leads):
+    if not leads:
+        return
+    ensure_data_dir()
+    file_exists = os.path.exists(LEADS_CSV_FILE)
+    try:
+        with open(LEADS_CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=HEADERS)
+            if not file_exists:
+                writer.writeheader()
+            for lead in leads:
+                writer.writerow({h: lead.get(h, "") for h in HEADERS})
+        logger.info("Appended %s leads to %s", len(leads), LEADS_CSV_FILE)
+    except Exception as e:
+        logger.error("Could not write CSV: %s", str(e))
+
+
+# ============================================================
+# COMMON CRAWL DISCOVERY (the free, high-volume source)
+# ============================================================
+
+def get_recent_cc_indexes(n):
+    try:
+        resp = requests.get(CC_COLLINFO_URL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        ids = [item["id"] for item in data if "id" in item]
+        return ids[:n]
+    except Exception as e:
+        logger.error("Could not fetch Common Crawl index list: %s", str(e))
+        return []
+
+
+def query_cc_index_page(index_id, url_pattern, page):
+    base = f"https://index.commoncrawl.org/{index_id}-index"
+    params = {
+        "url": url_pattern,
+        "output": "json",
+        "page": page,
+    }
+    headers = {"User-Agent": "lead-finder/1.0 (research use)"}
+
+    try:
+        resp = requests.get(base, params=params, headers=headers, timeout=30)
+    except requests.RequestException:
+        return set(), False
+
+    if resp.status_code != 200:
+        return set(), False
+
+    text = resp.text.strip()
+    if not text:
+        return set(), False
+
+    domains = set()
+    for line in text.split("\n"):
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        url = record.get("url", "")
+        domain = normalize_domain(url)
+        if domain:
+            domains.add(domain)
+
+    return domains, True
+
+
+def discover_via_common_crawl():
+    logger.info("Discovering candidates via Common Crawl (free, no quota)...")
+
+    indexes = get_recent_cc_indexes(CC_NUM_INDEXES_TO_USE)
+
+    if not indexes:
+        logger.warning("No Common Crawl indexes available. Skipping CC discovery.")
+        return set()
+
+    logger.info("Using Common Crawl indexes: %s", indexes)
+
+    all_domains = set()
+
+    for index_id in indexes:
+        logger.info("Querying index %s for pattern %s ...", index_id, CC_URL_PATTERN)
+
+        jobs = []
+        with ThreadPoolExecutor(max_workers=CC_PAGE_WORKERS) as executor:
+            futures = {
+                executor.submit(query_cc_index_page, index_id, CC_URL_PATTERN, page): page
+                for page in range(CC_MAX_PAGES_PER_INDEX)
+            }
+
+            empty_streak = 0
+
+            for future in as_completed(futures):
+                domains, ok = future.result()
+
+                if not ok or not domains:
+                    empty_streak += 1
+                    continue
+
+                all_domains |= domains
+
+        logger.info(
+            "Index %s done. Running total unique domains: %s",
+            index_id, len(all_domains)
+        )
+
+    logger.info("Common Crawl discovery complete: %s unique domains", len(all_domains))
+    return all_domains
+
+
+# ============================================================
+# OPTIONAL GOOGLE CSE (bonus, only runs if keys are set)
+# ============================================================
+
+NICHES = ["bags", "shoes", "fashion", "jewelry", "beauty", "supplements",
+          "fitness", "pet products", "home decor", "coffee", "gifts"]
+TEMPLATES = ["new arrivals", "best sellers", "shop now", "collections", "sale"]
+MODIFIERS = ["Shopify", "shop", "store", "official"]
 
 
 def build_query_pool():
     queries = []
-
     for niche in NICHES:
         for template in TEMPLATES:
             for modifier in MODIFIERS:
-                queries.append(
-                    f'"{niche}" "{template}" {modifier}'
-                )
-
-    # Remove duplicates
-    queries = list(dict.fromkeys(queries))
-
-    logger.info("Query pool created: %s unique queries", len(queries))
-
-    return queries
+                queries.append(f'"{niche}" "{template}" {modifier}')
+    return list(dict.fromkeys(queries))
 
 
-# ============================================================
-# GOOGLE API
-# ============================================================
-
-def validate_google_config():
-    """
-    We do not print secrets.
-    We only confirm whether GitHub injected them.
-    """
-
-    logger.info(
-        "GOOGLE_API_KEY present: %s",
-        bool(GOOGLE_API_KEY)
-    )
-
-    logger.info(
-        "GOOGLE_CSE_ID present: %s",
-        bool(GOOGLE_CSE_ID)
-    )
-
-    if not GOOGLE_API_KEY:
-        logger.error(
-            "GOOGLE_API_KEY is missing from GitHub Secrets."
-        )
-        return False
-
-    if not GOOGLE_CSE_ID:
-        logger.error(
-            "GOOGLE_CSE_ID is missing from GitHub Secrets."
-        )
-        return False
-
-    return True
-
-
-def search_google(query, start=1):
-    """
-    Google Custom Search request.
-
-    Important:
-    We print the REAL Google error reason when Google returns
-    403/400/401/etc.
-    """
-
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+def search_google(query):
+    if not USE_GOOGLE_CSE:
         return []
 
     params = {
@@ -194,103 +254,44 @@ def search_google(query, start=1):
         "cx": GOOGLE_CSE_ID,
         "q": query,
         "num": RESULTS_PER_QUERY,
-        "start": start,
     }
 
     try:
-        response = requests.get(
-            GOOGLE_SEARCH_URL,
-            params=params,
-            timeout=GOOGLE_TIMEOUT
-        )
-
-    except requests.RequestException as e:
-        logger.error(
-            "Google request failed: %s",
-            str(e)
-        )
+        response = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=30)
+    except requests.RequestException:
         return []
 
-    # --------------------------------------------------------
-    # SUCCESS
-    # --------------------------------------------------------
-
-    if response.status_code == 200:
-
-        try:
-            data = response.json()
-        except Exception:
-            logger.error("Google returned invalid JSON.")
-            return []
-
-        results = data.get("items", [])
-
-        output = []
-
-        for item in results:
-            link = item.get("link")
-
-            if link:
-                output.append(link)
-
-        return output
-
-    # --------------------------------------------------------
-    # ERROR
-    # --------------------------------------------------------
-
-    logger.error(
-        "Google HTTP %s for query: %s",
-        response.status_code,
-        query
-    )
+    if response.status_code != 200:
+        return []
 
     try:
-        error_data = response.json()
-
-        logger.error(
-            "Google error response:\n%s",
-            json.dumps(
-                error_data,
-                indent=2,
-                ensure_ascii=False
-            )
-        )
-
-        error = error_data.get("error", {})
-
-        logger.error(
-            "Google error message: %s",
-            error.get("message", "Unknown")
-        )
-
-        errors = error.get("errors", [])
-
-        if errors:
-            for err in errors:
-                logger.error(
-                    "Google reason=%s | domain=%s | message=%s",
-                    err.get("reason"),
-                    err.get("domain"),
-                    err.get("message")
-                )
-
+        data = response.json()
     except Exception:
-        logger.error(
-            "Raw Google response:\n%s",
-            response.text[:4000]
-        )
+        return []
 
-    # Do NOT pretend every 403 means quota.
-    if response.status_code == 403:
-        logger.error(
-            "IMPORTANT: Google returned 403. "
-            "Read the error 'reason' above. "
-            "It may be API restriction, disabled API, invalid "
-            "permission, billing/quota, or another configuration issue."
-        )
+    return [item.get("link") for item in data.get("items", []) if item.get("link")]
 
-    return []
+
+def discover_via_google():
+    if not USE_GOOGLE_CSE:
+        logger.info("Google CSE keys not set — skipping (optional bonus source).")
+        return set()
+
+    logger.info("Google CSE keys found — running bonus discovery (up to 100 queries/day).")
+
+    queries = build_query_pool()[:90]
+    domains = set()
+
+    for i, query in enumerate(queries, start=1):
+        urls = search_google(query)
+        for url in urls:
+            d = normalize_domain(url)
+            if d:
+                domains.add(d)
+        time.sleep(GOOGLE_DELAY_SECONDS)
+
+    logger.info("Google CSE discovery complete: %s domains", len(domains))
+    return domains
 
 
 # ============================================================
@@ -298,61 +299,37 @@ def search_google(query, start=1):
 # ============================================================
 
 def normalize_domain(url):
-
     try:
         parsed = urlparse(url)
-
         domain = parsed.netloc.lower()
-
         if domain.startswith("www."):
             domain = domain[4:]
-
         return domain
-
     except Exception:
         return ""
 
 
-def normalize_url(url):
-
+def normalize_url(domain_or_url):
     try:
-        parsed = urlparse(url)
-
-        if not parsed.scheme:
-            return "https://" + url
-
-        return f"{parsed.scheme}://{parsed.netloc}"
-
+        if domain_or_url.startswith("http://") or domain_or_url.startswith("https://"):
+            parsed = urlparse(domain_or_url)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return f"https://{domain_or_url}"
     except Exception:
-        return url
+        return domain_or_url
 
 
 def is_bad_domain(domain):
-
     bad_domains = [
-        "facebook.com",
-        "instagram.com",
-        "youtube.com",
-        "tiktok.com",
-        "pinterest.com",
-        "twitter.com",
-        "x.com",
-        "linkedin.com",
-        "amazon.com",
-        "ebay.com",
-        "etsy.com",
-        "walmart.com",
-        "reddit.com",
-        "google.com",
-        "bing.com",
-        "shopify.com",
+        "facebook.com", "instagram.com", "youtube.com", "tiktok.com",
+        "pinterest.com", "twitter.com", "x.com", "linkedin.com",
+        "amazon.com", "ebay.com", "etsy.com", "walmart.com", "reddit.com",
+        "google.com", "bing.com", "shopify.com", "apps.shopify.com",
+        "community.shopify.com", "help.shopify.com", "themes.shopify.com",
     ]
-
     for bad in bad_domains:
-
         if domain == bad or domain.endswith("." + bad):
             return True
-
     return False
 
 
@@ -361,149 +338,64 @@ def is_bad_domain(domain):
 # ============================================================
 
 def fetch_page(url):
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/131 Safari/537.36"
         )
     }
-
     try:
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True
-        )
-
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         if response.status_code >= 400:
             return "", response.url
-
         return response.text, response.url
-
     except Exception:
         return "", url
 
 
 # ============================================================
-# SHOPIFY DETECTION
+# SHOPIFY / THEME DETECTION
 # ============================================================
 
-def detect_shopify(html, headers=None):
-
+def detect_shopify(html):
     if not html:
         return False
-
     text = html.lower()
-
     indicators = [
-        "cdn.shopify.com",
-        "shopifycdn.com",
-        "shopify.theme",
-        "shopify.shop",
-        "myshopify.com",
-        "x-shopify-stage",
-        "shopify-section",
+        "cdn.shopify.com", "shopifycdn.com", "shopify.theme",
+        "shopify.shop", "myshopify.com", "shopify-section",
         "shopify-payment-button",
     ]
+    return any(ind in text for ind in indicators)
 
-    for indicator in indicators:
-
-        if indicator in text:
-            return True
-
-    if headers:
-
-        for key, value in headers.items():
-
-            combined = f"{key} {value}".lower()
-
-            if "shopify" in combined:
-                return True
-
-    return False
-
-
-# ============================================================
-# THEME DETECTION
-# ============================================================
 
 def detect_theme(html):
-
     if not html:
         return "Unknown"
-
     text = html.lower()
-
     themes = [
-        "dawn",
-        "refresh",
-        "sense",
-        "craft",
-        "ride",
-        "taste",
-        "origin",
-        "publisher",
-        "spotlight",
-        "studio",
-        "crave",
-        "colorblock",
-        "be yours",
-        "impulse",
-        "prestige",
-        "warehouse",
-        "motion",
-        "debut",
+        "dawn", "refresh", "sense", "craft", "ride", "taste", "origin",
+        "publisher", "spotlight", "studio", "crave", "colorblock",
+        "be yours", "impulse", "prestige", "warehouse", "motion", "debut",
     ]
-
     for theme in themes:
-
         if theme in text:
             return theme.title()
-
-    schema_match = re.search(
-        r'"theme_name"\s*:\s*"([^"]+)"',
-        html,
-        re.I
-    )
-
-    if schema_match:
-        return schema_match.group(1)
-
+    match = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html, re.I)
+    if match:
+        return match.group(1)
     return "Unknown"
 
 
-# ============================================================
-# PRODUCT COUNT
-# ============================================================
-
 def get_product_count(base_url):
-
     url = base_url.rstrip("/") + "/products.json?limit=250"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT
-        )
-
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             return 0
-
         data = response.json()
-
-        products = data.get("products", [])
-
-        return len(products)
-
+        return len(data.get("products", []))
     except Exception:
         return 0
 
@@ -512,75 +404,36 @@ def get_product_count(base_url):
 # EMAIL EXTRACTION
 # ============================================================
 
-EMAIL_REGEX = re.compile(
-    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-    re.I
-)
+EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 
 
 def extract_emails(text):
-
     if not text:
         return []
-
     emails = EMAIL_REGEX.findall(text)
-
     cleaned = []
-
+    bad_ext = (".png", ".jpg", ".jpeg", ".webp", ".gif")
     for email in emails:
-
         email = email.lower().strip()
-
-        bad_extensions = [
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".webp",
-            ".gif",
-        ]
-
-        if any(email.endswith(x) for x in bad_extensions):
+        if email.endswith(bad_ext):
             continue
-
         if email not in cleaned:
             cleaned.append(email)
-
     return cleaned
 
 
 def find_email(base_url, homepage_html):
-
     all_text = homepage_html
-
-    pages = [
-        "/contact",
-        "/pages/contact",
-        "/about",
-        "/pages/about",
-        "/privacy-policy",
-        "/policies/privacy-policy",
-    ]
-
+    pages = ["/contact", "/pages/contact", "/about", "/pages/about"]
     for path in pages:
-
         try:
-
-            url = base_url.rstrip("/") + path
-
-            html, _ = fetch_page(url)
-
+            html, _ = fetch_page(base_url.rstrip("/") + path)
             if html:
                 all_text += "\n" + html
-
         except Exception:
             pass
-
     emails = extract_emails(all_text)
-
-    if emails:
-        return emails[0]
-
-    return ""
+    return emails[0] if emails else ""
 
 
 # ============================================================
@@ -588,296 +441,88 @@ def find_email(base_url, homepage_html):
 # ============================================================
 
 def has_any(text, keywords):
-
     text = text.lower()
-
-    return any(keyword.lower() in text for keyword in keywords)
+    return any(k.lower() in text for k in keywords)
 
 
 def detect_features(html):
-
     text = html.lower()
-
-    features = {
-        "FAQ": has_any(
-            text,
-            [
-                "faq",
-                "frequently asked questions",
-                "questions",
-            ]
-        ),
-
-        "Testimonials": has_any(
-            text,
-            [
-                "testimonial",
-                "testimonials",
-                "what our customers say",
-                "customer stories",
-            ]
-        ),
-
-        "Reviews": has_any(
-            text,
-            [
-                "customer reviews",
-                "reviews",
-                "star-rating",
-                "rating",
-                "review-widget",
-                "judge.me",
-                "loox",
-                "yotpo",
-            ]
-        ),
-
-        "Sticky Add To Cart": has_any(
-            text,
-            [
-                "sticky add to cart",
-                "sticky-add-to-cart",
-                "sticky_atc",
-                "sticky-atc",
-            ]
-        ),
-
-        "Size Guide": has_any(
-            text,
-            [
-                "size guide",
-                "size chart",
-                "sizing guide",
-            ]
-        ),
-
-        "Newsletter": has_any(
-            text,
-            [
-                "newsletter",
-                "subscribe to our",
-                "email signup",
-                "sign up for",
-            ]
-        ),
-
-        "WhatsApp": has_any(
-            text,
-            [
-                "whatsapp",
-                "wa.me",
-                "whatsapp.com",
-            ]
-        ),
-
-        "Countdown": has_any(
-            text,
-            [
-                "countdown",
-                "count-down",
-                "limited time",
-                "ends in",
-            ]
-        ),
-
-        "Instagram": has_any(
-            text,
-            [
-                "instagram.com",
-                "instagram-feed",
-                "instagram gallery",
-            ]
-        ),
+    return {
+        "FAQ": has_any(text, ["faq", "frequently asked questions"]),
+        "Testimonials": has_any(text, ["testimonial", "what our customers say"]),
+        "Reviews": has_any(text, ["customer reviews", "reviews", "judge.me", "loox", "yotpo"]),
+        "Sticky Add To Cart": has_any(text, ["sticky add to cart", "sticky-atc"]),
+        "Size Guide": has_any(text, ["size guide", "size chart"]),
+        "Newsletter": has_any(text, ["newsletter", "subscribe to our"]),
+        "WhatsApp": has_any(text, ["whatsapp", "wa.me"]),
+        "Countdown": has_any(text, ["countdown", "limited time"]),
+        "Instagram": has_any(text, ["instagram.com", "instagram-feed"]),
     }
 
-    return features
-
 
 # ============================================================
-# REASON ENGINE
+# REASON ENGINE + SCORE
 # ============================================================
 
-def build_reasons(
-    theme,
-    product_count,
-    features,
-    email
-):
+def build_reasons(theme, product_count, features, email):
+    reasons, recommendations = [], []
 
-    reasons = []
-    recommendations = []
-
-    # Theme
     if theme == "Unknown":
+        reasons.append("Theme could not be identified")
+    else:
+        reasons.append(f"Uses theme: {theme}")
 
-        reasons.append(
-            "Theme could not be identified"
-        )
-
-    elif theme.lower() in [
-        "dawn",
-        "refresh",
-        "sense",
-        "craft",
-        "ride",
-        "taste",
-        "origin",
-        "publisher",
-        "spotlight",
-        "studio",
-    ]:
-
-        reasons.append(
-            f"Uses a common Shopify theme: {theme}"
-        )
-
-    # Products
     if product_count == 0:
-
-        reasons.append(
-            "Product catalog could not be detected"
-        )
-
+        reasons.append("Product catalog could not be detected")
     elif product_count < 10:
-
-        reasons.append(
-            f"Small product catalog ({product_count} products)"
-        )
-
+        reasons.append(f"Small product catalog ({product_count} products)")
     elif product_count >= 50:
+        reasons.append(f"Larger product catalog ({product_count} products)")
 
-        reasons.append(
-            f"Larger product catalog ({product_count} products)"
-        )
-
-    # Missing features
-    if not features["FAQ"]:
-
-        reasons.append(
-            "No obvious FAQ section detected"
-        )
-
-        recommendations.append("FAQ")
-
-    if not features["Testimonials"]:
-
-        reasons.append(
-            "No obvious testimonials section detected"
-        )
-
-        recommendations.append("Testimonials")
-
-    if not features["Reviews"]:
-
-        reasons.append(
-            "No obvious review system detected"
-        )
-
-        recommendations.append("Reviews")
-
-    if not features["Sticky Add To Cart"]:
-
-        reasons.append(
-            "No obvious sticky Add to Cart detected"
-        )
-
-        recommendations.append("Sticky Add to Cart")
-
-    if not features["Size Guide"]:
-
-        reasons.append(
-            "No obvious size guide detected"
-        )
-
-        recommendations.append("Size Guide")
-
-    if not features["Newsletter"]:
-
-        reasons.append(
-            "No obvious newsletter signup detected"
-        )
-
-        recommendations.append("Newsletter")
-
-    if not features["WhatsApp"]:
-
-        reasons.append(
-            "No obvious WhatsApp contact button detected"
-        )
-
-        recommendations.append("Sticky WhatsApp")
+    checks = [
+        ("FAQ", "No obvious FAQ section detected", "FAQ"),
+        ("Testimonials", "No obvious testimonials section detected", "Testimonials"),
+        ("Reviews", "No obvious review system detected", "Reviews"),
+        ("Sticky Add To Cart", "No obvious sticky Add to Cart detected", "Sticky Add to Cart"),
+        ("Size Guide", "No obvious size guide detected", "Size Guide"),
+        ("Newsletter", "No obvious newsletter signup detected", "Newsletter"),
+        ("WhatsApp", "No obvious WhatsApp contact button detected", "Sticky WhatsApp"),
+    ]
+    for key, reason_text, rec in checks:
+        if not features[key]:
+            reasons.append(reason_text)
+            recommendations.append(rec)
 
     if not features["Countdown"]:
-
         recommendations.append("Countdown Timer")
-
     if not features["Instagram"]:
-
         recommendations.append("Instagram Gallery")
 
-    # Email
     if email:
-
-        reasons.append(
-            "Business contact email found"
-        )
+        reasons.append("Business contact email found")
 
     return reasons, recommendations
 
 
-# ============================================================
-# SCORE
-# ============================================================
-
-def calculate_score(
-    product_count,
-    features,
-    email,
-    theme
-):
-
+def calculate_score(product_count, features, email, theme):
     score = 0
-
-    # Shopify theme
     if theme != "Unknown":
         score += 10
-
-    # Products
     if product_count >= 50:
         score += 20
-
     elif product_count >= 20:
         score += 15
-
     elif product_count >= 10:
         score += 10
-
     elif product_count > 0:
         score += 5
 
-    # Missing conversion features
-    if not features["FAQ"]:
-        score += 10
+    for key, pts in [("FAQ", 10), ("Testimonials", 10), ("Reviews", 10),
+                      ("Sticky Add To Cart", 10), ("Size Guide", 5),
+                      ("Newsletter", 5), ("WhatsApp", 5)]:
+        if not features[key]:
+            score += pts
 
-    if not features["Testimonials"]:
-        score += 10
-
-    if not features["Reviews"]:
-        score += 10
-
-    if not features["Sticky Add To Cart"]:
-        score += 10
-
-    if not features["Size Guide"]:
-        score += 5
-
-    if not features["Newsletter"]:
-        score += 5
-
-    if not features["WhatsApp"]:
-        score += 5
-
-    # Contactability
     if email:
         score += 15
 
@@ -885,16 +530,12 @@ def calculate_score(
 
 
 def score_quality(score):
-
     if score >= 75:
         return "HOT"
-
     if score >= 55:
         return "WARM"
-
     if score >= 35:
         return "GOOD"
-
     return "LOW"
 
 
@@ -902,320 +543,112 @@ def score_quality(score):
 # ANALYZE STORE
 # ============================================================
 
-def analyze_store(url, query):
-
-    base_url = normalize_url(url)
+def analyze_store(domain, source):
+    base_url = normalize_url(domain)
 
     try:
-
         html, final_url = fetch_page(base_url)
-
         if not html:
             return None
 
-        # Shopify check
         if not detect_shopify(html):
             return None
 
-        domain = normalize_domain(final_url)
-
-        if not domain:
-            return None
-
-        if is_bad_domain(domain):
+        final_domain = normalize_domain(final_url)
+        if not final_domain or is_bad_domain(final_domain):
             return None
 
         theme = detect_theme(html)
-
         product_count = get_product_count(base_url)
-
-        email = find_email(
-            base_url,
-            html
-        )
-
+        email = find_email(base_url, html)
         features = detect_features(html)
-
-        reasons, recommendations = build_reasons(
-            theme,
-            product_count,
-            features,
-            email
-        )
-
-        score = calculate_score(
-            product_count,
-            features,
-            email,
-            theme
-        )
-
+        reasons, recommendations = build_reasons(theme, product_count, features, email)
+        score = calculate_score(product_count, features, email, theme)
         quality = score_quality(score)
 
         return {
             "Store URL": base_url,
-            "Domain": domain,
+            "Domain": final_domain,
             "Theme": theme,
             "Email": email,
             "Products": product_count,
             "Lead Score": score,
             "Quality": quality,
-
             "FAQ": "YES" if features["FAQ"] else "NO",
-            "Testimonials": (
-                "YES"
-                if features["Testimonials"]
-                else "NO"
-            ),
-            "Reviews": (
-                "YES"
-                if features["Reviews"]
-                else "NO"
-            ),
-            "Sticky Add To Cart": (
-                "YES"
-                if features["Sticky Add To Cart"]
-                else "NO"
-            ),
-            "Size Guide": (
-                "YES"
-                if features["Size Guide"]
-                else "NO"
-            ),
-            "Newsletter": (
-                "YES"
-                if features["Newsletter"]
-                else "NO"
-            ),
-            "WhatsApp": (
-                "YES"
-                if features["WhatsApp"]
-                else "NO"
-            ),
-
+            "Testimonials": "YES" if features["Testimonials"] else "NO",
+            "Reviews": "YES" if features["Reviews"] else "NO",
+            "Sticky Add To Cart": "YES" if features["Sticky Add To Cart"] else "NO",
+            "Size Guide": "YES" if features["Size Guide"] else "NO",
+            "Newsletter": "YES" if features["Newsletter"] else "NO",
+            "WhatsApp": "YES" if features["WhatsApp"] else "NO",
             "Reason": " | ".join(reasons),
-
-            "Recommended Sections": ", ".join(
-                recommendations
-            ),
-
-            "Search Query": query,
+            "Recommended Sections": ", ".join(recommendations),
+            "Search Query": source,
         }
 
     except Exception as e:
-
-        logger.debug(
-            "Store analysis failed %s: %s",
-            url,
-            str(e)
-        )
-
+        logger.debug("Store analysis failed %s: %s", domain, str(e))
         return None
 
 
 # ============================================================
-# GOOGLE SHEETS
+# GOOGLE SHEETS (OPTIONAL)
 # ============================================================
 
 HEADERS = [
-    "Store URL",
-    "Domain",
-    "Theme",
-    "Email",
-    "Products",
-    "Lead Score",
-    "Quality",
-    "FAQ",
-    "Testimonials",
-    "Reviews",
-    "Sticky Add To Cart",
-    "Size Guide",
-    "Newsletter",
-    "WhatsApp",
-    "Reason",
-    "Recommended Sections",
-    "Search Query",
+    "Store URL", "Domain", "Theme", "Email", "Products", "Lead Score",
+    "Quality", "FAQ", "Testimonials", "Reviews", "Sticky Add To Cart",
+    "Size Guide", "Newsletter", "WhatsApp", "Reason",
+    "Recommended Sections", "Search Query",
 ]
 
 
 def connect_sheet():
-
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-
-        logger.error(
-            "GOOGLE_SERVICE_ACCOUNT_JSON is missing."
-        )
-
+    if not GSPREAD_AVAILABLE:
         return None
-
-    if not GOOGLE_SHEET_ID:
-
-        logger.error(
-            "GOOGLE_SHEET_ID is missing."
-        )
-
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
         return None
-
     try:
-
-        service_account_info = json.loads(
-            GOOGLE_SERVICE_ACCOUNT_JSON
-        )
-
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-
-        credentials = Credentials.from_service_account_info(
-            service_account_info,
-            scopes=scopes
-        )
-
+        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         client = gspread.authorize(credentials)
-
-        spreadsheet = client.open_by_key(
-            GOOGLE_SHEET_ID
-        )
-
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
         try:
-            worksheet = spreadsheet.worksheet(
-                SHEET_NAME
-            )
+            worksheet = spreadsheet.worksheet(SHEET_NAME)
         except Exception:
-            worksheet = spreadsheet.add_worksheet(
-                title=SHEET_NAME,
-                rows=1000,
-                cols=len(HEADERS)
-            )
-
+            worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADERS))
         return worksheet
-
     except Exception as e:
-
-        logger.error(
-            "Google Sheet connection failed: %s",
-            str(e)
-        )
-
+        logger.error("Google Sheet connection failed: %s", str(e))
         return None
 
 
 def setup_headers(worksheet):
-
     try:
-
         current = worksheet.row_values(1)
-
         if current != HEADERS:
-
-            worksheet.update(
-                values=[HEADERS],
-                range_name="A1"
-            )
-
-            logger.info(
-                "Sheet headers updated."
-            )
-
+            worksheet.update(values=[HEADERS], range_name="A1")
     except Exception as e:
-
-        logger.error(
-            "Could not update headers: %s",
-            str(e)
-        )
-
-
-def get_existing_domains(worksheet):
-
-    existing = set()
-
-    try:
-
-        values = worksheet.get_all_values()
-
-        if len(values) <= 1:
-            return existing
-
-        header = values[0]
-
-        try:
-            domain_index = header.index(
-                "Domain"
-            )
-        except ValueError:
-            domain_index = 1
-
-        for row in values[1:]:
-
-            if len(row) > domain_index:
-
-                domain = row[domain_index].strip().lower()
-
-                if domain:
-                    existing.add(domain)
-
-    except Exception as e:
-
-        logger.error(
-            "Could not read existing leads: %s",
-            str(e)
-        )
-
-    return existing
+        logger.error("Could not update headers: %s", str(e))
 
 
 def row_from_lead(lead):
-
-    return [
-        lead.get("Store URL", ""),
-        lead.get("Domain", ""),
-        lead.get("Theme", ""),
-        lead.get("Email", ""),
-        lead.get("Products", ""),
-        lead.get("Lead Score", ""),
-        lead.get("Quality", ""),
-        lead.get("FAQ", ""),
-        lead.get("Testimonials", ""),
-        lead.get("Reviews", ""),
-        lead.get("Sticky Add To Cart", ""),
-        lead.get("Size Guide", ""),
-        lead.get("Newsletter", ""),
-        lead.get("WhatsApp", ""),
-        lead.get("Reason", ""),
-        lead.get("Recommended Sections", ""),
-        lead.get("Search Query", ""),
-    ]
+    return [lead.get(h, "") for h in HEADERS]
 
 
-def save_leads(worksheet, leads):
-
+def save_leads_to_sheet(worksheet, leads):
     if not leads:
         return
-
-    rows = [
-        row_from_lead(lead)
-        for lead in leads
-    ]
-
+    rows = [row_from_lead(lead) for lead in leads]
     try:
-
-        worksheet.append_rows(
-            rows,
-            value_input_option="USER_ENTERED"
-        )
-
-        logger.info(
-            "Saved %s new leads to Google Sheet.",
-            len(rows)
-        )
-
+        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+        logger.info("Saved %s leads to Google Sheet.", len(rows))
     except Exception as e:
-
-        logger.error(
-            "Could not save leads: %s",
-            str(e)
-        )
+        logger.error("Could not save leads to sheet: %s", str(e))
 
 
 # ============================================================
@@ -1223,240 +656,91 @@ def save_leads(worksheet, leads):
 # ============================================================
 
 def main():
+    logger.info("=" * 70)
+    logger.info("SHOPIFY LEAD INTELLIGENCE ENGINE — FREE / HIGH VOLUME")
+    logger.info("=" * 70)
 
-    logger.info("=" * 70)
-    logger.info("SHOPIFY LEAD INTELLIGENCE ENGINE")
-    logger.info("=" * 70)
+    seen_domains = load_seen_domains()
+    logger.info("Previously seen domains (will skip): %s", len(seen_domains))
 
     # --------------------------------------------------------
-    # Validate Google config
+    # DISCOVERY
     # --------------------------------------------------------
+    cc_domains = discover_via_common_crawl()
+    google_domains = discover_via_google()
 
-    if not validate_google_config():
+    all_discovered = cc_domains | google_domains
+    logger.info("Total discovered (before dedupe against history): %s", len(all_discovered))
 
-        logger.error(
-            "Google configuration is incomplete."
-        )
+    new_domains = [d for d in all_discovered if d not in seen_domains and not is_bad_domain(d)]
+    logger.info("New unseen candidate domains: %s", len(new_domains))
 
+    if not new_domains:
+        logger.warning("No new domains discovered this run. Try again later or widen CC_URL_PATTERN.")
+        logger.info("RUN COMPLETE")
         return
 
-    # --------------------------------------------------------
-    # Connect Sheet
-    # --------------------------------------------------------
-
-    worksheet = connect_sheet()
-
-    if worksheet:
-
-        setup_headers(worksheet)
-
-        existing_domains = get_existing_domains(
-            worksheet
-        )
-
-        logger.info(
-            "Existing leads: %s",
-            len(existing_domains)
-        )
-
-    else:
-
-        logger.warning(
-            "Google Sheet unavailable. "
-            "The script will still perform discovery."
-        )
-
-        existing_domains = set()
+    candidates = new_domains[:MAX_DOMAINS_PER_RUN]
+    logger.info("Analyzing %s candidates this run (cap: %s)", len(candidates), MAX_DOMAINS_PER_RUN)
 
     # --------------------------------------------------------
-    # Build queries
+    # ANALYSIS
     # --------------------------------------------------------
-
-    query_pool = build_query_pool()
-
-    queries = query_pool[:MAX_QUERIES_PER_RUN]
-
-    logger.info(
-        "Queries this run: %s",
-        len(queries)
-    )
-
-    # --------------------------------------------------------
-    # Discovery
-    # --------------------------------------------------------
-
-    discovered = {}
-
-    for index, query in enumerate(
-        queries,
-        start=1
-    ):
-
-        logger.info(
-            "[%s/%s] Searching: %s",
-            index,
-            len(queries),
-            query
-        )
-
-        urls = search_google(query)
-
-        for url in urls:
-
-            domain = normalize_domain(url)
-
-            if not domain:
-                continue
-
-            if is_bad_domain(domain):
-                continue
-
-            if domain in existing_domains:
-                continue
-
-            if domain not in discovered:
-
-                discovered[domain] = {
-                    "url": url,
-                    "query": query
-                }
-
-        time.sleep(
-            GOOGLE_DELAY_SECONDS
-        )
-
-    logger.info(
-        "Unique domains discovered: %s",
-        len(discovered)
-    )
-
-    # --------------------------------------------------------
-    # Analyze
-    # --------------------------------------------------------
-
-    if not discovered:
-
-        logger.warning(
-            "No domains discovered."
-        )
-
-        logger.warning(
-            "If Google showed HTTP 403 above, "
-            "DO NOT change the lead analyzer. "
-            "Fix Google API configuration first."
-        )
-
-        logger.info(
-            "RUN COMPLETE"
-        )
-
-        return
-
-    candidates = list(
-        discovered.values()
-    )
-
-    logger.info(
-        "New candidates for analysis: %s",
-        len(candidates)
-    )
-
     leads = []
+    processed_domains = set()
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        future_map = {}
-
-        for candidate in candidates:
-
-            future = executor.submit(
-                analyze_store,
-                candidate["url"],
-                candidate["query"]
-            )
-
-            future_map[future] = candidate
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(analyze_store, domain, "common_crawl_or_google"): domain
+            for domain in candidates
+        }
 
         completed = 0
-
-        for future in as_completed(
-            future_map
-        ):
-
+        for future in as_completed(futures):
+            domain = futures[future]
             completed += 1
+            processed_domains.add(domain)
 
             try:
-
                 lead = future.result()
-
                 if lead:
-
                     leads.append(lead)
-
                     logger.info(
-                        "[%s/%s] Shopify lead: %s | %s | Score %s",
-                        completed,
-                        len(candidates),
-                        lead["Domain"],
-                        lead["Quality"],
-                        lead["Lead Score"]
+                        "[%s/%s] LEAD: %s | %s | Score %s",
+                        completed, len(candidates),
+                        lead["Domain"], lead["Quality"], lead["Lead Score"]
                     )
-
             except Exception as e:
+                logger.error("Analysis error for %s: %s", domain, str(e))
 
-                logger.error(
-                    "Analysis error: %s",
-                    str(e)
-                )
-
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
-
-    leads.sort(
-        key=lambda x: x.get(
-            "Lead Score",
-            0
-        ),
-        reverse=True
-    )
+            if completed % 200 == 0:
+                seen_domains |= processed_domains
+                save_seen_domains(seen_domains)
+                append_leads_csv(leads)
+                leads = []
+                logger.info("Checkpoint saved at %s processed.", completed)
 
     # --------------------------------------------------------
-    # Save
+    # FINAL SAVE
     # --------------------------------------------------------
+    seen_domains |= processed_domains
+    save_seen_domains(seen_domains)
 
-    if worksheet:
+    if leads:
+        leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
+        append_leads_csv(leads)
 
-        save_leads(
-            worksheet,
-            leads
-        )
-
-    # --------------------------------------------------------
-    # Stats
-    # --------------------------------------------------------
-
-    hot = sum(
-        1
-        for lead in leads
-        if lead.get("Quality") == "HOT"
-    )
-
-    warm = sum(
-        1
-        for lead in leads
-        if lead.get("Quality") == "WARM"
-    )
+        worksheet = connect_sheet()
+        if worksheet:
+            setup_headers(worksheet)
+            save_leads_to_sheet(worksheet, leads)
+        else:
+            logger.info("Google Sheet not configured — leads are in %s", LEADS_CSV_FILE)
 
     logger.info("=" * 70)
     logger.info("RUN COMPLETE")
-    logger.info("Discovered: %s", len(discovered))
-    logger.info("Analyzed: %s", len(candidates))
-    logger.info("Shopify leads saved: %s", len(leads))
-    logger.info("HOT leads: %s", hot)
-    logger.info("WARM leads: %s", warm)
+    logger.info("Candidates analyzed: %s", len(candidates))
+    logger.info("All leads this run saved to: %s", LEADS_CSV_FILE)
     logger.info("=" * 70)
 
 
