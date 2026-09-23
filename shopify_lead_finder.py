@@ -85,6 +85,9 @@ APP_STORE_HANDLES = [
 APP_STORE_MAX_PAGES = int(os.environ.get("APP_STORE_MAX_PAGES", "10"))   # pages per app
 APP_STORE_DELAY_SECONDS = float(os.environ.get("APP_STORE_DELAY", "0.4"))
 
+# --- How often (every N analyzed) to flush to CSV + Sheet during a run ---
+CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "50"))
+
 # --- Optional Google Sheets output ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -624,42 +627,67 @@ def extract_mailto_emails(html):
     return cleaned
 
 
-def find_email(base_url, homepage_html):
-    # 1) Check homepage for mailto: links first — highest confidence source.
-    mailto_hits = extract_mailto_emails(homepage_html)
-    if mailto_hits:
-        return mailto_hits[0]
-
-    all_text = homepage_html
-
-    # Shopify stores commonly expose a real business email on the contact
-    # page or on the auto-generated legal policy pages (merchants are
-    # required to provide one there for compliance reasons).
+def fetch_extra_pages(base_url, homepage_html):
+    """
+    Fetches contact/about/policy/support pages ONCE and returns the combined
+    text. This combined text is then reused for BOTH email extraction and
+    feature detection (FAQ/Testimonials/etc.) — previously feature detection
+    only looked at the homepage, which missed sections that live on their
+    own page (a very common Shopify pattern).
+    """
     pages = [
         "/contact",
         "/pages/contact",
         "/pages/contact-us",
+        "/pages/get-in-touch",
         "/about",
         "/pages/about",
+        "/pages/faq",
+        "/pages/faqs",
+        "/pages/support",
+        "/support",
+        "/help",
         "/policies/contact-information",
         "/policies/privacy-policy",
         "/policies/refund-policy",
         "/policies/terms-of-service",
     ]
 
+    combined_text = homepage_html or ""
+
     for path in pages:
         try:
             html, _ = fetch_page(base_url.rstrip("/") + path)
             if html:
-                mailto_hits = extract_mailto_emails(html)
-                if mailto_hits:
-                    return mailto_hits[0]
-                all_text += "\n" + html
+                combined_text += "\n" + html
         except Exception:
             pass
 
-    # 2) Fall back to a plain-text scan across everything we fetched.
-    emails = extract_emails(all_text)
+    return combined_text
+
+
+def guess_email_patterns(domain):
+    """
+    When no real email is found on the site, offer common pattern-based
+    guesses as a starting point. These are UNVERIFIED — clearly separated
+    into their own column so they're never confused with a confirmed email.
+    Verify before using for outreach (e.g. with an email-verification tool)
+    to avoid bounces.
+    """
+    if not domain:
+        return ""
+    prefixes = ["info", "contact", "support", "hello", "sales"]
+    return ", ".join(f"{p}@{domain}" for p in prefixes[:3])
+
+
+def find_email(combined_text):
+    # mailto: links are near-certain to be a real contact email — check first.
+    mailto_hits = extract_mailto_emails(combined_text)
+    if mailto_hits:
+        return mailto_hits[0]
+
+    # Fall back to a plain-text scan across everything fetched.
+    emails = extract_emails(combined_text)
     return emails[0] if emails else ""
 
 
@@ -787,8 +815,17 @@ def analyze_store(domain, source):
 
         theme = detect_theme(html)
         product_count = get_product_count(base_url)
-        email = find_email(base_url, html)
-        features = detect_features(html)
+
+        # Fetch contact/about/policy/support pages ONCE and reuse the
+        # combined text for both email extraction and feature detection —
+        # this is the "properly visit and analyze the site" pass, instead
+        # of judging FAQ/Testimonials/etc. off the homepage alone.
+        combined_text = fetch_extra_pages(base_url, html)
+
+        email = find_email(combined_text)
+        email_guessed = guess_email_patterns(final_domain) if not email else ""
+
+        features = detect_features(combined_text)
         reasons, recommendations = build_reasons(theme, product_count, features, email)
         score = calculate_score(product_count, features, email, theme)
         quality = score_quality(score)
@@ -798,6 +835,7 @@ def analyze_store(domain, source):
             "Domain": final_domain,
             "Theme": theme,
             "Email": email,
+            "Email (Guessed)": email_guessed,
             "Products": product_count,
             "Lead Score": score,
             "Quality": quality,
@@ -823,7 +861,7 @@ def analyze_store(domain, source):
 # ============================================================
 
 HEADERS = [
-    "Store URL", "Domain", "Theme", "Email", "Products", "Lead Score",
+    "Store URL", "Domain", "Theme", "Email", "Email (Guessed)", "Products", "Lead Score",
     "Quality", "FAQ", "Testimonials", "Reviews", "Sticky Add To Cart",
     "Size Guide", "Newsletter", "WhatsApp", "Reason",
     "Recommended Sections", "Search Query",
@@ -995,7 +1033,7 @@ def main():
             except Exception as e:
                 logger.error("Analysis error for %s: %s", domain, str(e))
 
-            if completed % 200 == 0:
+            if completed % CHECKPOINT_INTERVAL == 0:
                 seen_domains |= processed_domains
                 save_seen_domains(seen_domains)
 
