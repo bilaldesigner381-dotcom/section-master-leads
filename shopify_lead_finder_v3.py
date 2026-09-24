@@ -1,34 +1,27 @@
 """
-SHOPIFY LEAD FINDER v2 — APP STORE REVIEWS ONLY, EMAIL MANDATORY
-=================================================================
-Discovery : sirf Shopify App Store review pages (store names)
-Analysis  : har name ke liye domain guesses -> store visit -> verify
-Output    : Google Sheet ("Leads" tab) + local CSV backup
+SHOPIFY LEAD FINDER v3 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+=============================================================================
+Ab koi hardcoded app list nahi hai.
 
-RULE: sirf wohi store "Leads" me jata hai jiski REAL email site par mili.
-      Jin stores ki email nahi mili wo "NoEmail" tab me jate hain (baad me
-      manually / Hunter / Apollo se email nikalne ke liye) — leads me nahi.
+Har run:
+  1. Shopify ke apne sitemap (apps.shopify.com/sitemap -> sitemap_apps_en.xml) se
+     SAARI apps ki list uthata hai (16,000+ apps) — nayi apps sitemap me khud aa jati hain.
+  2. Google Sheet ke "Apps" tab me dekhta hai kaun si apps pehle scrape ho chuki hain,
+     aur agli NAYI apps chunta hai (jin ka review scrape nahi hua).
+     Sab nayi apps ho chuki hon to purani apps ke naye reviews (page 1..N) dobara dekhta hai.
+  3. In apps ke review pages se store names nikalta hai, jab tak NAMES_TARGET_PER_RUN
+     naye names na mil jayein.
+  4. Har name ke domain guesses -> store verify -> REAL email nikalna.
+  5. Email mili  -> "Leads" tab.   Email nahi mili -> "NoEmail" tab.
 
-Kya fix hua (purane version ke muqable me)
-------------------------------------------
-1. Google Sheet: service account ki Drive quota nahi hoti (403 error), is liye
-   ab aap khud sheet banate hain, service account ko Editor share karte hain,
-   aur GOOGLE_SHEET_ID dete hain. Script "Leads" + "NoEmail" tabs khud bana leti hai.
-2. Duplicates: ek store ke 8 domain-guesses ab ek hi task me sequentially try
-   hote hain aur pehli hit par ruk jate hain. Final domain par bhi dedupe hota hai.
-3. Junk stores: password-protected / khali stores, bina products wale stores, aur
-   woh stores jinka page review wale store name se match nahi karta (galat guess)
-   ab reject ho jate hain.
-4. Email: mailto, Cloudflare-protected, [at]/[dot], JSON-LD, contact/about/policy
-   pages, homepage ke contact links. Junk emails (theme/app/CDN wali) filter hoti
-   hain, store ke apne domain wali email ko priority milti hai, aur (dnspython ho
-   to) email ke domain ka MX record check hota hai taake bounce na ho.
-5. Theme detection: Shopify.theme JSON se (pehle 'withdrawn' me bhi 'dawn' pakad leta tha).
+State (kaun si apps / names ho chuke) Google Sheet me rehti hai (tabs: Apps, Checked),
+is liye har ghante naye server / GitHub runner par bhi run wahin se aage barhta hai.
+
+Run one-shot (cron / GitHub Actions ke liye):   python shopify_lead_finder_v3.py
+Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_lead_finder_v3.py
 
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
-
-Run:  python shopify_lead_finder_v2.py
 """
 
 import os
@@ -41,7 +34,7 @@ import html as html_lib
 import logging
 import requests
 
-from collections import Counter
+from collections import Counter, namedtuple
 from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -74,43 +67,54 @@ def _env_bool(name, default):
     return os.environ.get(name, "1" if default else "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-# --- Discovery: Shopify App Store reviews ---
-DEFAULT_APP_HANDLES = (
-    "judgeme,loox,product-reviews,ali-reviews,vitals,"
-    "klaviyo-email-marketing,privy,smile-io,recart,"
-    "seal-subscriptions,rebuy-personalization,pushowl-web-push"
-)
-APP_STORE_HANDLES = [
-    h.strip() for h in os.environ.get("APP_STORE_HANDLES", DEFAULT_APP_HANDLES).split(",")
-    if h.strip()
-]
-APP_STORE_MAX_PAGES = int(os.environ.get("APP_STORE_MAX_PAGES", "15"))
+# --- Dynamic app discovery ---
+SITEMAP_INDEX_URL = os.environ.get("APPS_SITEMAP_INDEX", "https://apps.shopify.com/sitemap").strip()
+APPS_SITEMAP_LANG = os.environ.get("APPS_SITEMAP_LANG", "en").strip()
+CATEGORY_FALLBACK_PAGES = int(os.environ.get("CATEGORY_FALLBACK_PAGES", "4"))   # sitemap fail ho to
+
+# --- How much to scrape per run ---
+NAMES_TARGET_PER_RUN = int(os.environ.get("NAMES_TARGET_PER_RUN", "2500"))      # naye store names ka target
+MAX_APPS_PER_RUN = int(os.environ.get("MAX_APPS_PER_RUN", "400"))
+PAGES_PER_NEW_APP = int(os.environ.get("PAGES_PER_NEW_APP", "30"))              # nayi app: itne review pages
+REFRESH_PAGES = int(os.environ.get("REFRESH_PAGES", "5"))                       # purani app: sirf naye reviews
+APP_SCRAPE_WORKERS = int(os.environ.get("APP_SCRAPE_WORKERS", "4"))
+APP_BATCH_SIZE = int(os.environ.get("APP_BATCH_SIZE", "8"))
 APP_STORE_DELAY_SECONDS = float(os.environ.get("APP_STORE_DELAY", "0.4"))
 
+# --- Time budget (hourly runs overlap na karein) ---
+SCRAPE_BUDGET_MINUTES = float(os.environ.get("SCRAPE_BUDGET_MINUTES", "12"))
+RUN_TIME_BUDGET_MINUTES = float(os.environ.get("RUN_TIME_BUDGET_MINUTES", "50"))
+
+# --- Loop mode (khud har ghante) ---
+RUN_FOREVER = _env_bool("RUN_FOREVER", False)
+RUN_EVERY_MINUTES = float(os.environ.get("RUN_EVERY_MINUTES", "60"))
+
 # --- Analysis ---
-MAX_NAMES_PER_RUN = int(os.environ.get("MAX_NAMES_PER_RUN", "3000"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
-CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "50"))
+CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "100"))
 
 # --- Quality filters ---
-MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))               # 0 = bina products wale stores bhi
-STRICT_NAME_MATCH = _env_bool("STRICT_NAME_MATCH", True)              # galat domain guesses reject
-VERIFY_MX = _env_bool("VERIFY_MX", True)                              # email domain ka MX check (dnspython chahiye)
+MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))
+STRICT_NAME_MATCH = _env_bool("STRICT_NAME_MATCH", True)
+VERIFY_MX = _env_bool("VERIFY_MX", True)
 EXCLUDE_DOMAINS = [
     d.strip().lower() for d in os.environ.get("EXCLUDE_DOMAINS", "").split(",") if d.strip()
 ]
 
 # --- Google Sheets ---
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()       # ID ya poora sheet URL
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Leads").strip()
 NO_EMAIL_SHEET_NAME = os.environ.get("GOOGLE_NO_EMAIL_SHEET_NAME", "NoEmail").strip()
-REQUIRE_SHEET = _env_bool("REQUIRE_SHEET", True)                      # sheet fail ho to run rok do
+APPS_SHEET_NAME = os.environ.get("GOOGLE_APPS_SHEET_NAME", "Apps").strip()
+CHECKED_SHEET_NAME = os.environ.get("GOOGLE_CHECKED_SHEET_NAME", "Checked").strip()
+REQUIRE_SHEET = _env_bool("REQUIRE_SHEET", True)
 
 # --- Local files ---
 DATA_DIR = os.environ.get("LEAD_DATA_DIR", "./lead_data")
 SEEN_FILE = os.path.join(DATA_DIR, "seen_names.json")
+APPS_STATE_FILE = os.path.join(DATA_DIR, "apps_state.json")
 LEADS_CSV_FILE = os.path.join(DATA_DIR, "leads.csv")
 NO_EMAIL_CSV_FILE = os.path.join(DATA_DIR, "no_email.csv")
 
@@ -121,6 +125,10 @@ HEADERS = [
     "Reason", "Recommended Sections", "Source",
 ]
 NO_EMAIL_HEADERS = ["Store Name", "Store URL", "Domain", "Products", "Source"]
+APPS_HEADERS = ["Handle", "Status", "Pages Scraped", "Names Found", "Last Scraped"]
+CHECKED_HEADERS = ["Key", "Store Name", "Checked"]
+
+SheetTabs = namedtuple("SheetTabs", "leads no_email apps checked")
 
 
 # ============================================================
@@ -141,6 +149,14 @@ logger = logging.getLogger("shopify-lead-finder")
 def norm(text):
     """Sirf lowercase letters+digits (matching ke liye)."""
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def name_key(name):
+    return f"name:{norm(name)}"
+
+
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
 def normalize_domain(url):
@@ -202,6 +218,25 @@ def save_seen(seen):
         logger.error("Could not save %s: %s", SEEN_FILE, str(e))
 
 
+def load_local_apps_state():
+    if not os.path.exists(APPS_STATE_FILE):
+        return {}
+    try:
+        with open(APPS_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_local_apps_state(state):
+    ensure_data_dir()
+    try:
+        with open(APPS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error("Could not save %s: %s", APPS_STATE_FILE, str(e))
+
+
 def ensure_csv_schema_matches(path, headers):
     """Purani CSV ke columns alag hon to usay rename kar deta hai (data safe)."""
     if not os.path.exists(path):
@@ -241,7 +276,98 @@ def append_csv(path, headers, records):
 
 
 # ============================================================
-# DISCOVERY: SHOPIFY APP STORE REVIEWS
+# DYNAMIC APP DISCOVERY (koi hardcoded app nahi)
+# ============================================================
+
+RESERVED_HANDLES = {
+    "categories", "collections", "partners", "stories", "search", "sitemap",
+    "login", "partner", "tutorials", "blog", "guides", "built-in-features",
+    "extensions", "category-features", "robots.txt",
+}
+
+
+def fetch_text(url, timeout=30, retries=3):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+        ),
+        "Accept-Language": "en-US;q=0.9",
+    }
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException:
+            time.sleep(2)
+            continue
+        if resp.status_code == 200:
+            return resp.text
+        if resp.status_code == 429:
+            time.sleep(5 * (attempt + 1))
+            continue
+        return ""
+    return ""
+
+
+def handle_from_url(url):
+    path = urlparse(url.strip()).path.strip("/")
+    if not path or "/" in path or path in RESERVED_HANDLES:
+        return ""
+    return path
+
+
+def discover_apps_via_categories():
+    """Fallback: sitemap na chale to category pages se app handles nikalta hai."""
+    logger.warning("Sitemap se apps nahi mili — category pages se try kar raha hun (fallback).")
+    home = fetch_text("https://apps.shopify.com/")
+    slugs = list(dict.fromkeys(re.findall(r"/categories/([a-z0-9-]+)", home)))[:40]
+    apps = {}
+    for slug in slugs:
+        for page in range(1, CATEGORY_FALLBACK_PAGES + 1):
+            page_html = fetch_text(f"https://apps.shopify.com/categories/{slug}/all?page={page}")
+            found = re.findall(
+                r'href="(?:https://apps\.shopify\.com)?/([a-z0-9][a-z0-9_-]*)\?[^"]*surface_type=category',
+                page_html,
+            )
+            if not found:
+                break
+            for h in found:
+                if h not in RESERVED_HANDLES:
+                    apps.setdefault(h, "")
+            time.sleep(APP_STORE_DELAY_SECONDS)
+    return apps
+
+
+def discover_app_handles():
+    """Returns [(handle, lastmod)] — recently updated (active) apps pehle."""
+    index_xml = fetch_text(SITEMAP_INDEX_URL)
+    sitemap_urls = re.findall(
+        r"<loc>\s*([^<\s]*sitemap_apps_%s\.xml[^<\s]*)\s*</loc>" % re.escape(APPS_SITEMAP_LANG),
+        index_xml,
+    )
+    if not sitemap_urls:
+        sitemap_urls = [f"https://apps.shopify.com/sitemap_apps_{APPS_SITEMAP_LANG}.xml"]
+
+    apps = {}
+    for sm_url in sitemap_urls:
+        xml = fetch_text(sm_url, timeout=90)
+        for m in re.finditer(
+            r"<url>\s*<loc>\s*([^<\s]+)\s*</loc>(?:\s*<lastmod>\s*([^<\s]*)\s*</lastmod>)?", xml
+        ):
+            handle = handle_from_url(m.group(1))
+            if handle:
+                apps.setdefault(handle, m.group(2) or "")
+
+    if not apps:
+        apps = discover_apps_via_categories()
+
+    ordered = sorted(apps.items(), key=lambda kv: kv[1], reverse=True)
+    logger.info("Apps discovered from Shopify App Store: %s", len(ordered))
+    return ordered
+
+
+# ============================================================
+# APP REVIEW SCRAPING
 # ============================================================
 
 TRAILING_GENERIC_WORDS = {"store", "shop", "official", "co", "llc", "inc", "ltd"}
@@ -249,7 +375,7 @@ GENERIC_NAME_WORDS = {"the", "and", "store", "shop", "official", "co", "llc", "i
 
 
 def scrape_app_reviews_page(handle, page):
-    """Ek review page se store display names (list)."""
+    """Returns (names_list, state) — state: 'ok' | 'missing' (404) | 'error'."""
     url = f"https://apps.shopify.com/{handle}/reviews"
     params = {"sort_by": "newest", "page": page}
     headers = {
@@ -272,10 +398,14 @@ def scrape_app_reviews_page(handle, page):
             continue
         break
     else:
-        return []
+        return [], "error"
 
-    if resp is None or resp.status_code != 200:
-        return []
+    if resp is None:
+        return [], "error"
+    if resp.status_code == 404:
+        return [], "missing"
+    if resp.status_code != 200:
+        return [], "error"
 
     soup = BeautifulSoup(resp.text, "html.parser")
     review_blocks = soup.find_all("div", attrs={"data-merchant-review": True})
@@ -297,34 +427,28 @@ def scrape_app_reviews_page(handle, page):
             "App %s page %s: review blocks mile lekin names parse nahi hue — "
             "shayad Shopify ne page ka HTML/CSS class badal diya hai.", handle, page
         )
-    return names
+    return names, "ok"
 
 
-def discover_store_names():
-    """Returns {store_name: app_handle}."""
-    if not BS4_AVAILABLE:
-        logger.error("beautifulsoup4 install nahi hai. Run: pip install beautifulsoup4")
-        return {}
-
-    logger.info("Scraping App Store reviews (%s apps)...", len(APP_STORE_HANDLES))
-    names = {}
-
-    for handle in APP_STORE_HANDLES:
-        logger.info("App: %s", handle)
-        found_any = False
-        for page in range(1, APP_STORE_MAX_PAGES + 1):
-            page_names = scrape_app_reviews_page(handle, page)
-            if not page_names:
-                break
-            found_any = True
-            for n in page_names:
-                names.setdefault(n, handle)
-            time.sleep(APP_STORE_DELAY_SECONDS)
-        if not found_any:
-            logger.warning("No reviews found for app handle: %s (typo, removed, ya blocked?)", handle)
-
-    logger.info("Unique store names collected: %s", len(names))
-    return names
+def scrape_app(handle, max_pages, deadline):
+    """Ek app ke review pages (newest pehle). Returns (names, pages_scraped, status)
+    status: 'done' | 'empty' | 'dead' | 'error'."""
+    all_names, pages, prev = [], 0, None
+    for page in range(1, max_pages + 1):
+        if time.time() > deadline:
+            break
+        page_names, state = scrape_app_reviews_page(handle, page)
+        if state == "missing":
+            return all_names, pages, ("dead" if page == 1 else "done")
+        if state == "error":
+            return all_names, pages, "error"
+        if not page_names or page_names == prev:   # khatam ya same page repeat
+            break
+        prev = page_names
+        pages += 1
+        all_names += page_names
+        time.sleep(APP_STORE_DELAY_SECONDS)
+    return all_names, pages, ("done" if all_names else "empty")
 
 
 def guess_domains_from_name(name):
@@ -362,6 +486,82 @@ def name_keys(name):
     core = "".join(core_words)
     tokens = [w for w in core_words if len(w) >= 3]
     return full, core, tokens
+
+
+def plan_apps(sitemap_apps, apps_state):
+    """Is run me kaun si apps scrape hongi: [(handle, max_pages, kind)].
+    Order: retry (unprocessed names) -> bilkul nayi apps -> error wali -> purani apps ka refresh."""
+    retry, fresh, errored = [], [], []
+    for handle, _ in sitemap_apps:
+        st = apps_state.get(handle, {}).get("status")
+        if st == "retry":
+            retry.append(handle)
+        elif st is None:
+            fresh.append(handle)
+        elif st == "error":
+            errored.append(handle)
+
+    refresh = sorted(
+        [h for h, s in apps_state.items() if s.get("status") == "done"],
+        key=lambda h: apps_state[h].get("last", ""),
+    )
+
+    plan = [(h, PAGES_PER_NEW_APP, "new") for h in retry + fresh + errored]
+    plan += [(h, REFRESH_PAGES, "refresh") for h in refresh]
+    return plan, {"retry": len(retry), "new": len(fresh), "error": len(errored), "refresh": len(refresh)}
+
+
+def collect_new_names(plan, seen, deadline):
+    """Apps scrape karta hai jab tak NAMES_TARGET_PER_RUN naye names na mil jayein.
+    Returns (new_names {name: app_handle}, app_updates {handle: state_dict})."""
+    new_names, updates = {}, {}
+    apps_done, bad_batches = 0, 0
+
+    with ThreadPoolExecutor(max_workers=APP_SCRAPE_WORKERS) as executor:
+        idx = 0
+        while idx < len(plan):
+            if (len(new_names) >= NAMES_TARGET_PER_RUN or apps_done >= MAX_APPS_PER_RUN
+                    or time.time() > deadline):
+                break
+
+            batch = plan[idx: idx + APP_BATCH_SIZE]
+            idx += APP_BATCH_SIZE
+            futures = {executor.submit(scrape_app, h, pages, deadline): (h, kind) for h, pages, kind in batch}
+            errors_in_batch = 0
+
+            for future in as_completed(futures):
+                handle, kind = futures[future]
+                apps_done += 1
+                try:
+                    names, pages, status = future.result()
+                except Exception as e:
+                    logger.error("App scrape error %s: %s", handle, str(e))
+                    names, pages, status = [], 0, "error"
+
+                if status == "error":
+                    errors_in_batch += 1
+                    if kind == "new":
+                        updates[handle] = {"status": "error", "pages": pages, "names": len(names), "last": now_str()}
+                elif kind == "refresh" and status != "done":
+                    pass   # purani app ka refresh khali aaya — state waise hi rehne do
+                else:
+                    updates[handle] = {"status": status, "pages": pages, "names": len(names), "last": now_str()}
+
+                for n in names:
+                    if (norm(n) and name_key(n) not in seen and n not in new_names
+                            and guess_domains_from_name(n)):
+                        new_names[n] = handle
+
+            bad_batches = bad_batches + 1 if errors_in_batch == len(batch) else 0
+            if bad_batches >= 3:
+                logger.warning(
+                    "Lagataar 3 batches fail (rate-limit / block?) — is run me scraping rok raha hun, "
+                    "agli run me dobara try hoga."
+                )
+                break
+
+    logger.info("Apps scraped this run: %s | new store names: %s", apps_done, len(new_names))
+    return new_names, updates
 
 
 # ============================================================
@@ -864,12 +1064,14 @@ def analyze_store(domain, store_name, source_app):
         return "error", None
 
 
-def process_store_name(name, handle, guesses):
-    """Ek store name ke saare domain guesses sequentially try karta hai aur
-    pehli asli hit (ok ya no_email) par ruk jata hai — duplicates + faltu requests khatam.
-    Returns (status, data, reasons_counter)."""
+def process_store_name(name, handle, guesses, deadline):
+    """Ek store name ke saare domain guesses sequentially try karta hai aur pehli asli hit
+    (ok ya no_email) par ruk jata hai. Time budget khatam ho to 'timeout' (name seen nahi banta,
+    agli run me dobara try hota hai).  Returns (status, data, reasons_counter)."""
     reasons = Counter()
     for domain in guesses:
+        if time.time() > deadline:
+            return "timeout", None, reasons
         status, data = analyze_store(domain, name, handle)
         if status in ("ok", "no_email"):
             return status, data, reasons
@@ -917,13 +1119,13 @@ def get_or_create_tab(spreadsheet, title, headers):
 
 
 def connect_sheets():
-    """Returns (leads_ws, no_email_ws) ya (None, None)."""
+    """Returns SheetTabs(leads, no_email, apps, checked) ya None."""
     if not GSPREAD_AVAILABLE:
         logger.error("Run: pip install gspread google-auth")
-        return None, None
+        return None
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         logger.error("GOOGLE_SERVICE_ACCOUNT_JSON env var set nahi hai.")
-        return None, None
+        return None
     if not GOOGLE_SHEET_ID:
         logger.error(
             "GOOGLE_SHEET_ID set nahi hai. Service account khud sheet create nahi kar sakta "
@@ -931,7 +1133,7 @@ def connect_sheets():
             "banayein, (2) usay service account ki email par Editor share karein, (3) sheet ka "
             "URL ya ID GOOGLE_SHEET_ID me daal dein."
         )
-        return None, None
+        return None
 
     client_email = "?"
     try:
@@ -950,9 +1152,12 @@ def connect_sheets():
         spreadsheet = client.open_by_key(parse_sheet_id(GOOGLE_SHEET_ID))
         logger.info("Connected to Google Sheet: %s", spreadsheet.url)
 
-        leads_ws = get_or_create_tab(spreadsheet, SHEET_NAME, HEADERS)
-        no_email_ws = get_or_create_tab(spreadsheet, NO_EMAIL_SHEET_NAME, NO_EMAIL_HEADERS)
-        return leads_ws, no_email_ws
+        return SheetTabs(
+            leads=get_or_create_tab(spreadsheet, SHEET_NAME, HEADERS),
+            no_email=get_or_create_tab(spreadsheet, NO_EMAIL_SHEET_NAME, NO_EMAIL_HEADERS),
+            apps=get_or_create_tab(spreadsheet, APPS_SHEET_NAME, APPS_HEADERS),
+            checked=get_or_create_tab(spreadsheet, CHECKED_SHEET_NAME, CHECKED_HEADERS),
+        )
 
     except json.JSONDecodeError:
         logger.error("GOOGLE_SERVICE_ACCOUNT_JSON valid JSON nahi — key file ka poora content paste karein, path nahi.")
@@ -966,7 +1171,7 @@ def connect_sheets():
             "Google Sheet connection failed: %s | Check: Sheets API + Drive API enable hain? "
             "Sheet %s ko Editor share hui?", str(e), client_email
         )
-    return None, None
+    return None
 
 
 def load_tab_column(ws, headers, column_name):
@@ -990,151 +1195,240 @@ def save_rows_to_sheet(ws, headers, records, label):
         except Exception as e:
             logger.error("Sheet save attempt %s failed (%s): %s", attempt + 1, label, str(e))
             time.sleep(5 * (attempt + 1))
-    logger.error("Sheet me save nahi ho saka (%s) — in rows ki copy local CSV me hai.", label)
+    logger.error("Sheet me save nahi ho saka (%s) — leads ki copy local CSV me hai.", label)
+
+
+def load_apps_state(apps_ws):
+    """Apps tab -> {handle: {status, pages, names, last, row}}"""
+    state = {}
+    try:
+        rows = apps_ws.get_all_values()
+    except Exception as e:
+        logger.error("Could not read Apps tab: %s", str(e))
+        return state
+    for row_no, row in enumerate(rows[1:], start=2):
+        row = list(row) + [""] * (len(APPS_HEADERS) - len(row))
+        handle = row[0].strip()
+        if handle:
+            state[handle] = {"status": row[1].strip(), "pages": row[2], "names": row[3],
+                             "last": row[4].strip(), "row": row_no}
+    return state
+
+
+def save_apps_state(apps_ws, state, updates):
+    """Purani rows ko batch-update, nayi apps ko append."""
+    if not updates:
+        return
+    new_rows, batch = [], []
+    for handle, u in updates.items():
+        values = [u["status"], u["pages"], u["names"], u["last"]]
+        cur = state.get(handle)
+        if cur and cur.get("row"):
+            batch.append({"range": f"B{cur['row']}:E{cur['row']}", "values": [values]})
+        else:
+            new_rows.append([handle] + values)
+
+    try:
+        for i in range(0, len(new_rows), 1000):
+            apps_ws.append_rows(new_rows[i:i + 1000], value_input_option="RAW")
+        for i in range(0, len(batch), 400):
+            apps_ws.batch_update(batch[i:i + 400], value_input_option="RAW")
+        logger.info("Apps tab updated: %s new, %s updated.", len(new_rows), len(batch))
+    except Exception as e:
+        logger.error("Could not update Apps tab: %s", str(e))
 
 
 # ============================================================
-# MAIN
+# ONE RUN
 # ============================================================
 
-def main():
+def run_once():
+    """Returns 0 on success, 1 on setup failure."""
+    t0 = time.time()
+    scrape_deadline = t0 + SCRAPE_BUDGET_MINUTES * 60
+    run_deadline = t0 + RUN_TIME_BUDGET_MINUTES * 60
+
     logger.info("=" * 70)
-    logger.info("SHOPIFY LEAD FINDER v2 — App Store reviews only | email mandatory")
+    logger.info("SHOPIFY LEAD FINDER v3 — dynamic apps | email mandatory | budget %s min", RUN_TIME_BUDGET_MINUTES)
     logger.info("=" * 70)
 
     ensure_data_dir()
     ensure_csv_schema_matches(LEADS_CSV_FILE, HEADERS)
     ensure_csv_schema_matches(NO_EMAIL_CSV_FILE, NO_EMAIL_HEADERS)
 
-    # Sheet pehle connect hoti hai — masla ho to scraping se pehle pata chal jaye.
-    leads_ws, no_email_ws = connect_sheets()
-    if leads_ws is None:
+    tabs = connect_sheets()
+    if tabs is None:
         if REQUIRE_SHEET:
             logger.error("Sheet connect nahi hui, isliye run ruk gaya (REQUIRE_SHEET=0 set karein to CSV-only chalega).")
-            sys.exit(1)
+            return 1
         logger.warning("Sheet ke baghair CSV-only mode me chal raha hun: %s", LEADS_CSV_FILE)
 
     # ---------------- Already-processed data ----------------
     seen = load_seen()                       # entries: "name:<normalized store name>"
     found_final_domains = set()
 
-    if leads_ws is not None:
-        lead_domains = load_tab_column(leads_ws, HEADERS, "Domain")
-        lead_names = load_tab_column(leads_ws, HEADERS, "Store Name")
-        ne_domains = load_tab_column(no_email_ws, NO_EMAIL_HEADERS, "Domain")
-        ne_names = load_tab_column(no_email_ws, NO_EMAIL_HEADERS, "Store Name")
+    if tabs is not None:
+        apps_state = load_apps_state(tabs.apps)
+        checked_keys = load_tab_column(tabs.checked, CHECKED_HEADERS, "Key")
+        lead_names = load_tab_column(tabs.leads, HEADERS, "Store Name")
+        ne_names = load_tab_column(tabs.no_email, NO_EMAIL_HEADERS, "Store Name")
+        lead_domains = load_tab_column(tabs.leads, HEADERS, "Domain")
+        ne_domains = load_tab_column(tabs.no_email, NO_EMAIL_HEADERS, "Domain")
+        seen |= {f"name:{k}" for k in checked_keys}
+        seen |= {name_key(n) for n in lead_names + ne_names}
         found_final_domains |= {d.lower() for d in lead_domains + ne_domains}
-        seen |= {f"name:{norm(n)}" for n in lead_names + ne_names}
-        logger.info("Sheet me pehle se: %s leads, %s no-email stores", len(lead_domains), len(ne_domains))
+        logger.info(
+            "Sheet me pehle se: %s leads | %s no-email | %s checked names | %s apps tracked",
+            len(lead_domains), len(ne_domains), len(checked_keys), len(apps_state)
+        )
+    else:
+        apps_state = {h: dict(s) for h, s in load_local_apps_state().items()}
 
     logger.info("Already processed store names (will skip): %s", len(seen))
 
-    # ---------------- DISCOVERY ----------------
-    names = discover_store_names()
+    # ---------------- DYNAMIC APP DISCOVERY + REVIEW SCRAPING ----------------
+    if not BS4_AVAILABLE:
+        logger.error("beautifulsoup4 install nahi hai. Run: pip install beautifulsoup4")
+        return 1
 
+    sitemap_apps = discover_app_handles()
+    if not sitemap_apps:
+        logger.error("Shopify App Store se koi app nahi mili (network / block?). Agli run me dobara try hoga.")
+        return 1
+
+    plan, plan_counts = plan_apps(sitemap_apps, apps_state)
+    logger.info(
+        "App queue -> retry: %s | never scraped: %s | previously errored: %s | refresh (purani apps): %s",
+        plan_counts["retry"], plan_counts["new"], plan_counts["error"], plan_counts["refresh"]
+    )
+
+    new_names, app_updates = collect_new_names(plan, seen, scrape_deadline)
+
+    # Apps ki state PEHLE save (scraping ho chuki hai) — retry wali baad me overwrite hongi.
     todo = []
-    for name, handle in names.items():
-        key = f"name:{norm(name)}"
-        if key in seen:
-            continue
+    for name, handle in new_names.items():
         guesses = [d for d in guess_domains_from_name(name) if not is_bad_domain(d)]
         if guesses:
             todo.append((name, handle, guesses))
 
-    logger.info("New store names to analyze: %s", len(todo))
-    if not todo:
-        logger.warning("Koi naya store name nahi mila. Baad me try karein ya APP_STORE_HANDLES badhayein.")
-        logger.info("RUN COMPLETE")
-        return
-
-    todo = todo[:MAX_NAMES_PER_RUN]
-    logger.info("Analyzing %s store names this run (cap: %s)", len(todo), MAX_NAMES_PER_RUN)
+    logger.info("Store names to analyze this run: %s", len(todo))
 
     # ---------------- ANALYSIS ----------------
-    leads, no_email_rows = [], []
+    leads, no_email_rows, checked_rows = [], [], []
     stats = Counter()
     reason_stats = Counter()
+    completed_names = set()
     completed = 0
 
     def flush():
-        nonlocal leads, no_email_rows
+        nonlocal leads, no_email_rows, checked_rows
         if leads:
             append_csv(LEADS_CSV_FILE, HEADERS, leads)
-            save_rows_to_sheet(leads_ws, HEADERS, leads, SHEET_NAME)
+            if tabs is not None:
+                save_rows_to_sheet(tabs.leads, HEADERS, leads, SHEET_NAME)
             leads = []
         if no_email_rows:
             append_csv(NO_EMAIL_CSV_FILE, NO_EMAIL_HEADERS, no_email_rows)
-            save_rows_to_sheet(no_email_ws, NO_EMAIL_HEADERS, no_email_rows, NO_EMAIL_SHEET_NAME)
+            if tabs is not None:
+                save_rows_to_sheet(tabs.no_email, NO_EMAIL_HEADERS, no_email_rows, NO_EMAIL_SHEET_NAME)
             no_email_rows = []
+        if checked_rows:
+            if tabs is not None:
+                save_rows_to_sheet(tabs.checked, CHECKED_HEADERS, checked_rows, CHECKED_SHEET_NAME)
+            checked_rows = []
         save_seen(seen)
 
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    try:
-        futures = {
-            executor.submit(process_store_name, name, handle, guesses): name
-            for name, handle, guesses in todo
-        }
+    if todo:
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        try:
+            futures = {
+                executor.submit(process_store_name, name, handle, guesses, run_deadline): name
+                for name, handle, guesses in todo
+            }
 
-        for future in as_completed(futures):
-            name = futures[future]
-            completed += 1
+            for future in as_completed(futures):
+                name = futures[future]
 
-            try:
-                status, data, reasons = future.result()
-            except Exception as e:
-                logger.error("Analysis error for %s: %s", name, str(e))
-                status, data, reasons = "not_found", None, Counter({"error": 1})
+                try:
+                    status, data, reasons = future.result()
+                except Exception as e:
+                    logger.error("Analysis error for %s: %s", name, str(e))
+                    status, data, reasons = "timeout", None, Counter()
 
-            reason_stats.update(reasons)
+                if status == "timeout":
+                    continue                      # seen nahi banega -> agli run me dobara
 
-            # Transient errors wale names ko 'seen' nahi banate taake agli run me dobara try hon.
-            if not reasons.get("error"):
-                seen.add(f"name:{norm(name)}")
+                completed += 1
+                completed_names.add(name)
+                reason_stats.update(reasons)
 
-            if status == "ok":
-                domain = data["Domain"].lower()
-                if domain in found_final_domains:
-                    stats["duplicate"] += 1
+                # Transient errors wale names ko 'seen' nahi banate taake agli run me dobara try hon.
+                if not reasons.get("error"):
+                    seen.add(name_key(name))
+                    checked_rows.append({"Key": norm(name), "Store Name": name, "Checked": now_str()})
+
+                if status == "ok":
+                    domain = data["Domain"].lower()
+                    if domain in found_final_domains:
+                        stats["duplicate"] += 1
+                    else:
+                        found_final_domains.add(domain)
+                        leads.append(data)
+                        stats["leads"] += 1
+                        logger.info(
+                            "[%s/%s] LEAD: %s | %s | %s | Score %s",
+                            completed, len(todo), data["Domain"], data["Email"],
+                            data["Quality"], data["Lead Score"]
+                        )
+                elif status == "no_email":
+                    domain = data["Domain"].lower()
+                    if domain in found_final_domains:
+                        stats["duplicate"] += 1
+                    else:
+                        found_final_domains.add(domain)
+                        no_email_rows.append(data)
+                        stats["no_email"] += 1
                 else:
-                    found_final_domains.add(domain)
-                    leads.append(data)
-                    stats["leads"] += 1
-                    logger.info(
-                        "[%s/%s] LEAD: %s | %s | %s | Score %s",
-                        completed, len(todo), data["Domain"], data["Email"],
-                        data["Quality"], data["Lead Score"]
-                    )
-            elif status == "no_email":
-                domain = data["Domain"].lower()
-                if domain in found_final_domains:
-                    stats["duplicate"] += 1
-                else:
-                    found_final_domains.add(domain)
-                    no_email_rows.append(data)
-                    stats["no_email"] += 1
-            else:
-                stats["not_found"] += 1
+                    stats["not_found"] += 1
 
-            if completed % CHECKPOINT_INTERVAL == 0:
-                flush()
-                logger.info("Checkpoint saved at %s/%s.", completed, len(todo))
+                if completed % CHECKPOINT_INTERVAL == 0:
+                    flush()
+                    logger.info("Checkpoint saved at %s/%s.", completed, len(todo))
 
-    except KeyboardInterrupt:
-        logger.warning("Interrupted — ab tak ka data save kar raha hun...")
-        executor.shutdown(wait=False, cancel_futures=True)
-    finally:
-        executor.shutdown(wait=False)
-        leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
-        flush()
+        except KeyboardInterrupt:
+            logger.warning("Interrupted — ab tak ka data save kar raha hun...")
+            executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            executor.shutdown(wait=False)
+            leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
+            flush()
+
+    # ---------------- APP STATE SAVE ----------------
+    # Jin apps ke kuch names time budget ki wajah se process nahi hue, unhein 'retry' mark karte hain
+    # taake agli run me pehle wahi scrape hon (names lose na hon).
+    unprocessed = [(n, h) for n, h, _ in todo if n not in completed_names]
+    for _, handle in unprocessed:
+        if handle in app_updates:
+            app_updates[handle]["status"] = "retry"
+        else:
+            app_updates[handle] = {"status": "retry", "pages": 0, "names": 0, "last": now_str()}
+
+    if tabs is not None:
+        save_apps_state(tabs.apps, apps_state, app_updates)
+    for handle, u in app_updates.items():
+        apps_state[handle] = {**apps_state.get(handle, {}), **u}
+    save_local_apps_state({h: {k: v for k, v in s.items() if k != "row"} for h, s in apps_state.items()})
 
     # ---------------- SUMMARY ----------------
+    minutes = (time.time() - t0) / 60
     logger.info("=" * 70)
-    logger.info("RUN COMPLETE")
-    logger.info("Store names analyzed: %s", completed)
+    logger.info("RUN COMPLETE in %.1f min", minutes)
+    logger.info("Apps scraped: %s | new store names found: %s | analyzed: %s", len(app_updates), len(todo), completed)
     logger.info("LEADS saved (real email found): %s", stats["leads"])
     logger.info("Shopify stores but NO email (-> '%s' tab): %s", NO_EMAIL_SHEET_NAME, stats["no_email"])
-    logger.info("Names jinka koi valid store nahi mila: %s", stats["not_found"])
-    logger.info("Duplicates skipped: %s", stats["duplicate"])
+    logger.info("Names jinka koi valid store nahi mila: %s | Duplicates skipped: %s", stats["not_found"], stats["duplicate"])
+    if unprocessed:
+        logger.info("Time budget khatam: %s names agli run me (apps 'retry' mark hui).", len(unprocessed))
     if reason_stats:
         logger.info(
             "Guesses reject hone ki wajah -> not_shopify: %s | password: %s | "
@@ -1142,10 +1436,38 @@ def main():
             reason_stats["not_shopify"], reason_stats["password"],
             reason_stats["name_mismatch"], reason_stats["no_products"], reason_stats["error"]
         )
+    logger.info("Apps abhi tak kabhi scrape nahi hui (baaqi): %s", max(plan_counts["new"] - sum(
+        1 for h, _, k in plan if k == "new" and h in app_updates), 0))
     logger.info("CSV backup: %s", LEADS_CSV_FILE)
-    if leads_ws is not None:
-        logger.info("Google Sheet tab: %s", SHEET_NAME)
     logger.info("=" * 70)
+    return 0
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main():
+    if not RUN_FOREVER:
+        sys.exit(run_once())
+
+    logger.info("Loop mode: har %s minute me ek run.", RUN_EVERY_MINUTES)
+    while True:
+        started = time.time()
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            logger.info("Stopped by user.")
+            return
+        except Exception as e:
+            logger.exception("Run crashed: %s", str(e))
+        sleep_for = max(60, RUN_EVERY_MINUTES * 60 - (time.time() - started))
+        logger.info("Agli run %.0f minute baad.", sleep_for / 60)
+        try:
+            time.sleep(sleep_for)
+        except KeyboardInterrupt:
+            logger.info("Stopped by user.")
+            return
 
 
 if __name__ == "__main__":
