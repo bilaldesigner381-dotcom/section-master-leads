@@ -1,24 +1,33 @@
-# Is file ko repo me is path par rakhein:  .github/workflows/lead-finder.yml
-# Secrets (Settings -> Secrets and variables -> Actions):
-#   GOOGLE_SERVICE_ACCOUNT_JSON  = service account key ka poora JSON
-#   GOOGLE_SHEET_ID              = sheet ka URL ya ID (sheet service account ko Editor share ho)
+# Path: .github/workflows/hourly-leads.yml
+# Secrets: GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID
+#
+# Kaam: run khatam hone ke baad workflow khud agla run trigger karta hai (kam az kam 55 min baad),
+# is liye GitHub ke cron ke skip/late hone se farq nahi padta. Cron sirf backup hai.
+# Pehli baar Actions tab se "Run workflow" dabayein, chain phir khud chalti rahegi.
 
 name: Shopify Lead Finder (hourly)
 
 on:
   schedule:
-    - cron: "17 * * * *"      # har ghante, 17 minute par
-  workflow_dispatch:           # manual run button
+    - cron: "17 * * * *"      # backup
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write               # agla run trigger karne ke liye
 
 concurrency:
-  group: lead-finder           # pichli run chal rahi ho to naya run overlap nahi karega
+  group: lead-finder           # ek waqt me sirf ek run
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 60
     steps:
+      - name: Remember start time
+        run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -35,3 +44,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           RUN_TIME_BUDGET_MINUTES: "45"
           NAMES_TARGET_PER_RUN: "2500"
+
+      - name: Wait until 55 min since start, then trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          elapsed=$(( $(date +%s) - START_TS ))
+          wait=$(( 3300 - elapsed ))
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
