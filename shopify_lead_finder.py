@@ -1,32 +1,49 @@
 """
-SHOPIFY LEAD INTELLIGENCE ENGINE — FREE / HIGH-VOLUME VERSION
-================================================================
-Discovery is powered by Common Crawl (https://commoncrawl.org), a public,
-free, unlimited dataset of internet crawls. No API key, no daily quota.
-We query it for URLs under *.myshopify.com, which are guaranteed-real
-Shopify stores. A single Common Crawl index page can return 10,000+ URLs,
-so a handful of pages easily gives you thousands of unique candidate
-domains per run — something Google CSE's 100/day free quota can never do.
+SHOPIFY LEAD FINDER v2 — APP STORE REVIEWS ONLY, EMAIL MANDATORY
+=================================================================
+Discovery : sirf Shopify App Store review pages (store names)
+Analysis  : har name ke liye domain guesses -> store visit -> verify
+Output    : Google Sheet ("Leads" tab) + local CSV backup
 
-Google Custom Search (if you have keys) is kept as an OPTIONAL bonus
-source layered on top — not required.
+RULE: sirf wohi store "Leads" me jata hai jiski REAL email site par mili.
+      Jin stores ki email nahi mili wo "NoEmail" tab me jate hain (baad me
+      manually / Hunter / Apollo se email nikalne ke liye) — leads me nahi.
 
-Output:
-  - Always writes to a local CSV (works with zero configuration)
-  - Also writes to Google Sheets IF you set the Sheets env vars
+Kya fix hua (purane version ke muqable me)
+------------------------------------------
+1. Google Sheet: service account ki Drive quota nahi hoti (403 error), is liye
+   ab aap khud sheet banate hain, service account ko Editor share karte hain,
+   aur GOOGLE_SHEET_ID dete hain. Script "Leads" + "NoEmail" tabs khud bana leti hai.
+2. Duplicates: ek store ke 8 domain-guesses ab ek hi task me sequentially try
+   hote hain aur pehli hit par ruk jate hain. Final domain par bhi dedupe hota hai.
+3. Junk stores: password-protected / khali stores, bina products wale stores, aur
+   woh stores jinka page review wale store name se match nahi karta (galat guess)
+   ab reject ho jate hain.
+4. Email: mailto, Cloudflare-protected, [at]/[dot], JSON-LD, contact/about/policy
+   pages, homepage ke contact links. Junk emails (theme/app/CDN wali) filter hoti
+   hain, store ke apne domain wali email ko priority milti hai, aur (dnspython ho
+   to) email ke domain ka MX record check hota hai taake bounce na ho.
+5. Theme detection: Shopify.theme JSON se (pehle 'withdrawn' me bhi 'dawn' pakad leta tha).
 
-Run:  python shopify_lead_finder.py
+Install:
+  pip install requests beautifulsoup4 gspread google-auth dnspython
+
+Run:  python shopify_lead_finder_v2.py
 """
 
 import os
 import re
+import sys
 import csv
-import time
 import json
+import time
+import html as html_lib
 import logging
 import requests
 
-from urllib.parse import urlparse
+from collections import Counter
+from functools import lru_cache
+from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -42,37 +59,22 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# --- Common Crawl discovery settings ---
-CC_COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
-CC_NUM_INDEXES_TO_USE = int(os.environ.get("CC_NUM_INDEXES", "2"))      # how many recent crawl snapshots to query
-CC_MAX_PAGES_PER_INDEX = int(os.environ.get("CC_MAX_PAGES", "15"))      # each page ≈ thousands of URLs
-CC_URL_PATTERN = os.environ.get("CC_URL_PATTERN", "myshopify.com")     # domain to match (no wildcard needed)
-CC_PAGE_WORKERS = int(os.environ.get("CC_PAGE_WORKERS", "6"))
+def _env_bool(name, default):
+    return os.environ.get(name, "1" if default else "0").strip().lower() in ("1", "true", "yes", "on")
 
-# --- How many NEW candidate domains to actually analyze this run ---
-MAX_DOMAINS_PER_RUN = int(os.environ.get("MAX_DOMAINS_PER_RUN", "3000"))
 
-# --- Analysis concurrency ---
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
-REQUEST_TIMEOUT = 12
-
-# --- Optional Google CSE (bonus source, not required) ---
-GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
-GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "").strip()
-USE_GOOGLE_CSE = bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
-RESULTS_PER_QUERY = 10
-GOOGLE_DELAY_SECONDS = 0.5
-
-# --- Shopify App Store review scraping (bonus source, store-NAME guesses) ---
-# Review pages only expose the store's display name + country, not a URL,
-# so we scrape names, turn each into 2-4 candidate domains, and let the
-# normal analyze_store() step verify/discard them (no extra code needed).
+# --- Discovery: Shopify App Store reviews ---
 DEFAULT_APP_HANDLES = (
     "judgeme,loox,product-reviews,ali-reviews,vitals,"
     "klaviyo-email-marketing,privy,smile-io,recart,"
@@ -82,26 +84,43 @@ APP_STORE_HANDLES = [
     h.strip() for h in os.environ.get("APP_STORE_HANDLES", DEFAULT_APP_HANDLES).split(",")
     if h.strip()
 ]
-APP_STORE_MAX_PAGES = int(os.environ.get("APP_STORE_MAX_PAGES", "10"))   # pages per app
+APP_STORE_MAX_PAGES = int(os.environ.get("APP_STORE_MAX_PAGES", "15"))
 APP_STORE_DELAY_SECONDS = float(os.environ.get("APP_STORE_DELAY", "0.4"))
 
-# --- How often (every N analyzed) to flush to CSV + Sheet during a run ---
+# --- Analysis ---
+MAX_NAMES_PER_RUN = int(os.environ.get("MAX_NAMES_PER_RUN", "3000"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "50"))
 
-# --- Optional Google Sheets output ---
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-# If set, a newly auto-created sheet is shared with this address as Editor
-# so it shows up in your own Google Drive (a service account's own sheets
-# are invisible to you otherwise).
-GOOGLE_SHARE_WITH_EMAIL = os.environ.get("GOOGLE_SHARE_WITH_EMAIL", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Leads").strip()
+# --- Quality filters ---
+MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))               # 0 = bina products wale stores bhi
+STRICT_NAME_MATCH = _env_bool("STRICT_NAME_MATCH", True)              # galat domain guesses reject
+VERIFY_MX = _env_bool("VERIFY_MX", True)                              # email domain ka MX check (dnspython chahiye)
+EXCLUDE_DOMAINS = [
+    d.strip().lower() for d in os.environ.get("EXCLUDE_DOMAINS", "").split(",") if d.strip()
+]
 
-# --- Local persistent files (always used, zero config needed) ---
+# --- Google Sheets ---
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()       # ID ya poora sheet URL
+SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Leads").strip()
+NO_EMAIL_SHEET_NAME = os.environ.get("GOOGLE_NO_EMAIL_SHEET_NAME", "NoEmail").strip()
+REQUIRE_SHEET = _env_bool("REQUIRE_SHEET", True)                      # sheet fail ho to run rok do
+
+# --- Local files ---
 DATA_DIR = os.environ.get("LEAD_DATA_DIR", "./lead_data")
-SEEN_DOMAINS_FILE = os.path.join(DATA_DIR, "seen_domains.json")
-CREATED_SHEET_ID_FILE = os.path.join(DATA_DIR, "created_sheet_id.txt")
+SEEN_FILE = os.path.join(DATA_DIR, "seen_names.json")
 LEADS_CSV_FILE = os.path.join(DATA_DIR, "leads.csv")
+NO_EMAIL_CSV_FILE = os.path.join(DATA_DIR, "no_email.csv")
+
+HEADERS = [
+    "Store Name", "Store URL", "Domain", "Email", "Other Emails", "Theme",
+    "Products", "Lead Score", "Quality", "FAQ", "Testimonials", "Reviews",
+    "Sticky Add To Cart", "Size Guide", "Newsletter", "WhatsApp",
+    "Reason", "Recommended Sections", "Source",
+]
+NO_EMAIL_HEADERS = ["Store Name", "Store URL", "Domain", "Products", "Source"]
 
 
 # ============================================================
@@ -116,381 +135,17 @@ logger = logging.getLogger("shopify-lead-finder")
 
 
 # ============================================================
-# LOCAL PERSISTENCE (dedupe across daily runs, works with no setup)
+# SMALL HELPERS
 # ============================================================
 
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+def norm(text):
+    """Sirf lowercase letters+digits (matching ke liye)."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
-
-def load_seen_domains():
-    ensure_data_dir()
-    if not os.path.exists(SEEN_DOMAINS_FILE):
-        return set()
-    try:
-        with open(SEEN_DOMAINS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_seen_domains(domains):
-    ensure_data_dir()
-    try:
-        with open(SEEN_DOMAINS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(domains), f)
-    except Exception as e:
-        logger.error("Could not save seen_domains.json: %s", str(e))
-
-
-def append_leads_csv(leads):
-    if not leads:
-        return
-    ensure_data_dir()
-    file_exists = os.path.exists(LEADS_CSV_FILE)
-    try:
-        with open(LEADS_CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=HEADERS)
-            if not file_exists:
-                writer.writeheader()
-            for lead in leads:
-                writer.writerow({h: lead.get(h, "") for h in HEADERS})
-        logger.info("Appended %s leads to %s", len(leads), LEADS_CSV_FILE)
-    except Exception as e:
-        logger.error("Could not write CSV: %s", str(e))
-
-
-# ============================================================
-# COMMON CRAWL DISCOVERY (the free, high-volume source)
-# ============================================================
-
-def get_recent_cc_indexes(n):
-    try:
-        resp = requests.get(CC_COLLINFO_URL, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        ids = [item["id"] for item in data if "id" in item]
-        return ids[:n]
-    except Exception as e:
-        logger.error("Could not fetch Common Crawl index list: %s", str(e))
-        return []
-
-
-def query_cc_index_page(index_id, url_pattern, page):
-    """
-    Uses matchType=domain, which is the documented/reliable way to get a
-    domain + all its subdomains from the CC Index Server. (The "*.domain"
-    wildcard syntax gets url-encoded by requests into %2A and silently
-    matches nothing — that was the bug causing 0 results.)
-    """
-    base = f"https://index.commoncrawl.org/{index_id}-index"
-
-    # Strip any leading "*." the user might still pass via env var, since
-    # matchType=domain already implies "this domain + all subdomains".
-    clean_pattern = url_pattern[2:] if url_pattern.startswith("*.") else url_pattern
-
-    params = {
-        "url": clean_pattern,
-        "matchType": "domain",
-        "output": "json",
-        "page": page,
-    }
-    headers = {"User-Agent": "lead-finder/1.0 (research use)"}
-
-    try:
-        resp = requests.get(base, params=params, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        logger.error("CC index request failed (index=%s page=%s): %s", index_id, page, str(e))
-        return set(), False
-
-    if resp.status_code == 404:
-        # Page beyond the last available page — normal end-of-results signal.
-        return set(), False
-
-    if resp.status_code != 200:
-        # Log the FIRST failure per index in detail so it's debuggable,
-        # instead of silently returning nothing like before.
-        logger.error(
-            "CC index HTTP %s (index=%s page=%s): %s",
-            resp.status_code, index_id, page, resp.text[:300]
-        )
-        return set(), False
-
-    text = resp.text.strip()
-    if not text:
-        return set(), False
-
-    domains = set()
-    for line in text.split("\n"):
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-        url = record.get("url", "")
-        domain = normalize_domain(url)
-        if domain:
-            domains.add(domain)
-
-    return domains, True
-
-
-def discover_via_common_crawl():
-    logger.info("Discovering candidates via Common Crawl (free, no quota)...")
-
-    indexes = get_recent_cc_indexes(CC_NUM_INDEXES_TO_USE)
-
-    if not indexes:
-        logger.warning("No Common Crawl indexes available. Skipping CC discovery.")
-        return set()
-
-    logger.info("Using Common Crawl indexes: %s", indexes)
-
-    # Quick single-page diagnostic BEFORE launching full pagination, so a
-    # broken query fails fast with a clear reason instead of silently
-    # burning through every page.
-    test_domains, test_ok = query_cc_index_page(indexes[0], CC_URL_PATTERN, 0)
-    if not test_ok:
-        logger.error(
-            "Common Crawl diagnostic query returned no usable data. "
-            "Check the error above (rate limit / API change / pattern issue)."
-        )
-    else:
-        logger.info(
-            "Diagnostic check OK: index %s page 0 returned %s domains.",
-            indexes[0], len(test_domains)
-        )
-
-    all_domains = set(test_domains)
-
-    for index_id in indexes:
-        logger.info("Querying index %s for pattern %s ...", index_id, CC_URL_PATTERN)
-
-        jobs = []
-        with ThreadPoolExecutor(max_workers=CC_PAGE_WORKERS) as executor:
-            futures = {
-                executor.submit(query_cc_index_page, index_id, CC_URL_PATTERN, page): page
-                for page in range(CC_MAX_PAGES_PER_INDEX)
-            }
-
-            empty_streak = 0
-
-            for future in as_completed(futures):
-                domains, ok = future.result()
-
-                if not ok or not domains:
-                    empty_streak += 1
-                    continue
-
-                all_domains |= domains
-
-        logger.info(
-            "Index %s done. Running total unique domains: %s",
-            index_id, len(all_domains)
-        )
-
-    logger.info("Common Crawl discovery complete: %s unique domains", len(all_domains))
-    return all_domains
-
-
-# ============================================================
-# OPTIONAL GOOGLE CSE (bonus, only runs if keys are set)
-# ============================================================
-
-NICHES = ["bags", "shoes", "fashion", "jewelry", "beauty", "supplements",
-          "fitness", "pet products", "home decor", "coffee", "gifts"]
-TEMPLATES = ["new arrivals", "best sellers", "shop now", "collections", "sale"]
-MODIFIERS = ["Shopify", "shop", "store", "official"]
-
-
-def build_query_pool():
-    queries = []
-    for niche in NICHES:
-        for template in TEMPLATES:
-            for modifier in MODIFIERS:
-                queries.append(f'"{niche}" "{template}" {modifier}')
-    return list(dict.fromkeys(queries))
-
-
-def search_google(query):
-    if not USE_GOOGLE_CSE:
-        return []
-
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "num": RESULTS_PER_QUERY,
-    }
-
-    try:
-        response = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=30)
-    except requests.RequestException:
-        return []
-
-    if response.status_code != 200:
-        return []
-
-    try:
-        data = response.json()
-    except Exception:
-        return []
-
-    return [item.get("link") for item in data.get("items", []) if item.get("link")]
-
-
-def discover_via_google():
-    if not USE_GOOGLE_CSE:
-        logger.info("Google CSE keys not set — skipping (optional bonus source).")
-        return set()
-
-    logger.info("Google CSE keys found — running bonus discovery (up to 100 queries/day).")
-
-    queries = build_query_pool()[:90]
-    domains = set()
-
-    for i, query in enumerate(queries, start=1):
-        urls = search_google(query)
-        for url in urls:
-            d = normalize_domain(url)
-            if d:
-                domains.add(d)
-        time.sleep(GOOGLE_DELAY_SECONDS)
-
-    logger.info("Google CSE discovery complete: %s domains", len(domains))
-    return domains
-
-
-# ============================================================
-# SHOPIFY APP STORE REVIEW SCRAPING (bonus, name-guess based)
-# ============================================================
-
-def scrape_app_reviews_page(handle, page):
-    """
-    Returns a set of store display names found on one review page.
-    Structure confirmed against apps.shopify.com's review block:
-    div[data-merchant-review] > (meta block, author/location block)
-    """
-    url = f"https://apps.shopify.com/{handle}/reviews"
-    params = {"sort_by": "newest", "page": page}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-        ),
-        "Accept-Language": "en-US;q=0.9",
-    }
-
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20)
-    except requests.RequestException:
-        return set()
-
-    if resp.status_code != 200:
-        return set()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    review_blocks = soup.find_all("div", attrs={"data-merchant-review": True})
-
-    names = set()
-    for block in review_blocks:
-        children = block.find_all("div", recursive=False)
-        if len(children) < 2:
-            continue
-
-        info_block = children[1]
-        author_div = info_block.find("div", class_="tw-text-fg-primary")
-        if not author_div:
-            continue
-
-        name = author_div.get_text(strip=True)
-        if name:
-            names.add(name)
-
-    return names
-
-
-def guess_domains_from_name(name):
-    """
-    Turns a store display name into a handful of plausible domain guesses.
-    These are UNVERIFIED — analyze_store() will fetch each one and only
-    keep it if it's a live, real Shopify store. Wrong guesses are dropped
-    automatically at zero extra cost.
-    """
-    base = re.sub(r"[^a-z0-9\s-]", "", name.lower()).strip()
-    if not base:
-        return set()
-
-    nospace = re.sub(r"\s+", "", base)
-    dashed = re.sub(r"\s+", "-", base).strip("-")
-
-    guesses = set()
-    if nospace:
-        guesses.add(f"{nospace}.myshopify.com")
-        guesses.add(f"{nospace}.com")
-    if dashed and dashed != nospace:
-        guesses.add(f"{dashed}.myshopify.com")
-        guesses.add(f"{dashed}.com")
-
-    return guesses
-
-
-def discover_via_app_store_reviews():
-    if not BS4_AVAILABLE:
-        logger.warning(
-            "beautifulsoup4 not installed — skipping App Store review "
-            "discovery. Run: pip install beautifulsoup4"
-        )
-        return set()
-
-    logger.info(
-        "Scraping Shopify App Store reviews for store names (%s apps)...",
-        len(APP_STORE_HANDLES)
-    )
-
-    all_names = set()
-
-    for handle in APP_STORE_HANDLES:
-        logger.info("App: %s", handle)
-        found_any_on_app = False
-
-        for page in range(1, APP_STORE_MAX_PAGES + 1):
-            names = scrape_app_reviews_page(handle, page)
-
-            if not names:
-                break  # ran out of review pages for this app
-
-            all_names |= names
-            found_any_on_app = True
-            time.sleep(APP_STORE_DELAY_SECONDS)
-
-        if not found_any_on_app:
-            logger.warning("No reviews found for app handle: %s (typo or app removed?)", handle)
-
-    logger.info("App Store reviews: %s unique store names collected", len(all_names))
-
-    candidate_domains = set()
-    for name in all_names:
-        candidate_domains |= guess_domains_from_name(name)
-
-    logger.info(
-        "App Store reviews: %s candidate domains generated (unverified guesses, "
-        "will be filtered during analysis)",
-        len(candidate_domains)
-    )
-
-    return candidate_domains
-
-
-# ============================================================
-# URL HELPERS
-# ============================================================
 
 def normalize_domain(url):
     try:
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
+        domain = urlparse(url).netloc.lower()
         if domain.startswith("www."):
             domain = domain[4:]
         return domain
@@ -500,7 +155,7 @@ def normalize_domain(url):
 
 def normalize_url(domain_or_url):
     try:
-        if domain_or_url.startswith("http://") or domain_or_url.startswith("https://"):
+        if domain_or_url.startswith(("http://", "https://")):
             parsed = urlparse(domain_or_url)
             return f"{parsed.scheme}://{parsed.netloc}"
         return f"https://{domain_or_url}"
@@ -515,15 +170,202 @@ def is_bad_domain(domain):
         "amazon.com", "ebay.com", "etsy.com", "walmart.com", "reddit.com",
         "google.com", "bing.com", "shopify.com", "apps.shopify.com",
         "community.shopify.com", "help.shopify.com", "themes.shopify.com",
-    ]
-    for bad in bad_domains:
-        if domain == bad or domain.endswith("." + bad):
-            return True
-    return False
+    ] + EXCLUDE_DOMAINS
+    return any(domain == bad or domain.endswith("." + bad) for bad in bad_domains)
 
 
 # ============================================================
-# WEBSITE FETCH
+# LOCAL PERSISTENCE
+# ============================================================
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_seen():
+    ensure_data_dir()
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_seen(seen):
+    ensure_data_dir()
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(seen), f)
+    except Exception as e:
+        logger.error("Could not save %s: %s", SEEN_FILE, str(e))
+
+
+def ensure_csv_schema_matches(path, headers):
+    """Purani CSV ke columns alag hon to usay rename kar deta hai (data safe)."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            existing = next(csv.reader(f), None)
+    except Exception as e:
+        logger.error("Could not read CSV header %s: %s", path, str(e))
+        return
+
+    if existing is not None and existing != headers:
+        base, ext = os.path.splitext(path)
+        backup = f"{base}_old_schema_{time.strftime('%Y%m%d-%H%M%S')}{ext}"
+        try:
+            os.rename(path, backup)
+            logger.warning("Purani CSV ke columns alag the — data safe hai: %s", backup)
+        except Exception as e:
+            logger.error("Could not rotate %s: %s", path, str(e))
+
+
+def append_csv(path, headers, records):
+    if not records:
+        return
+    ensure_data_dir()
+    file_exists = os.path.exists(path)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            for r in records:
+                writer.writerow({h: r.get(h, "") for h in headers})
+        logger.info("Appended %s rows to %s", len(records), path)
+    except Exception as e:
+        logger.error("Could not write %s: %s", path, str(e))
+
+
+# ============================================================
+# DISCOVERY: SHOPIFY APP STORE REVIEWS
+# ============================================================
+
+TRAILING_GENERIC_WORDS = {"store", "shop", "official", "co", "llc", "inc", "ltd"}
+GENERIC_NAME_WORDS = {"the", "and", "store", "shop", "official", "co", "llc", "inc", "ltd"}
+
+
+def scrape_app_reviews_page(handle, page):
+    """Ek review page se store display names (list)."""
+    url = f"https://apps.shopify.com/{handle}/reviews"
+    params = {"sort_by": "newest", "page": page}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+        ),
+        "Accept-Language": "en-US;q=0.9",
+    }
+
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=20)
+        except requests.RequestException:
+            time.sleep(2)
+            continue
+        if resp.status_code == 429:
+            time.sleep(5 * (attempt + 1))
+            continue
+        break
+    else:
+        return []
+
+    if resp is None or resp.status_code != 200:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    review_blocks = soup.find_all("div", attrs={"data-merchant-review": True})
+
+    names = []
+    for block in review_blocks:
+        children = block.find_all("div", recursive=False)
+        if len(children) < 2:
+            continue
+        author_div = children[1].find("div", class_="tw-text-fg-primary")
+        if not author_div:
+            continue
+        name = author_div.get_text(strip=True)
+        if name:
+            names.append(name)
+
+    if review_blocks and not names:
+        logger.warning(
+            "App %s page %s: review blocks mile lekin names parse nahi hue — "
+            "shayad Shopify ne page ka HTML/CSS class badal diya hai.", handle, page
+        )
+    return names
+
+
+def discover_store_names():
+    """Returns {store_name: app_handle}."""
+    if not BS4_AVAILABLE:
+        logger.error("beautifulsoup4 install nahi hai. Run: pip install beautifulsoup4")
+        return {}
+
+    logger.info("Scraping App Store reviews (%s apps)...", len(APP_STORE_HANDLES))
+    names = {}
+
+    for handle in APP_STORE_HANDLES:
+        logger.info("App: %s", handle)
+        found_any = False
+        for page in range(1, APP_STORE_MAX_PAGES + 1):
+            page_names = scrape_app_reviews_page(handle, page)
+            if not page_names:
+                break
+            found_any = True
+            for n in page_names:
+                names.setdefault(n, handle)
+            time.sleep(APP_STORE_DELAY_SECONDS)
+        if not found_any:
+            logger.warning("No reviews found for app handle: %s (typo, removed, ya blocked?)", handle)
+
+    logger.info("Unique store names collected: %s", len(names))
+    return names
+
+
+def guess_domains_from_name(name):
+    """Store name -> possible domains (ordered, unverified)."""
+    cleaned = re.sub(r"[^a-z0-9\s-]", "", name.lower()).strip()
+    words = [w for w in cleaned.split() if w.strip("-")]
+    if not words:
+        return []
+
+    variants = [words]
+    trimmed = list(words)
+    while len(trimmed) > 1 and trimmed[-1] in TRAILING_GENERIC_WORDS:
+        trimmed = trimmed[:-1]
+    if trimmed != words:
+        variants.append(trimmed)
+
+    guesses = []
+    for v in variants:
+        for slug in ("".join(v), "-".join(v)):
+            slug = slug.strip("-")
+            if len(slug) < 3:
+                continue
+            for d in (f"{slug}.myshopify.com", f"{slug}.com"):
+                if d not in guesses:
+                    guesses.append(d)
+    return guesses
+
+
+def name_keys(name):
+    """(full, core, significant_tokens) — page matching ke liye."""
+    words = [w.strip("-") for w in re.sub(r"[^a-z0-9\s-]", "", name.lower()).split()]
+    words = [w for w in words if w]
+    core_words = [w for w in words if w not in GENERIC_NAME_WORDS]
+    full = "".join(words)
+    core = "".join(core_words)
+    tokens = [w for w in core_words if len(w) >= 3]
+    return full, core, tokens
+
+
+# ============================================================
+# WEBSITE FETCH + VERIFICATION
 # ============================================================
 
 def fetch_page(url):
@@ -542,10 +384,6 @@ def fetch_page(url):
         return "", url
 
 
-# ============================================================
-# SHOPIFY / THEME DETECTION
-# ============================================================
-
 def detect_shopify(html):
     if not html:
         return False
@@ -558,146 +396,301 @@ def detect_shopify(html):
     return any(ind in text for ind in indicators)
 
 
+def is_password_page(html, final_url):
+    """Password-protected / 'opening soon' store — asli live store nahi."""
+    if urlparse(final_url).path.rstrip("/") == "/password":
+        return True
+    return bool(re.search(r'<form[^>]+action=["\']/password["\']', html or "", re.I))
+
+
+def page_identity_text(html):
+    """Page title + og tags (name-match ke liye). Domain/handle jaan-boojh kar shamil nahi —
+    wo guess se bane hote hain, isliye unka match hona koi saboot nahi."""
+    parts = []
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    if m:
+        parts.append(m.group(1))
+    for tag in re.finditer(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:site_name|og:title|application-name)["\'][^>]*>',
+        html, re.I
+    ):
+        c = re.search(r'content=["\']([^"\']*)["\']', tag.group(0), re.I)
+        if c:
+            parts.append(c.group(1))
+    return html_lib.unescape(" ".join(parts))
+
+
+def name_matches_page(store_name, final_domain, html):
+    """Review wale store name ka page title / og:site_name se match hona (ya custom
+    domain ka name se milna). Isse 'mystore.myshopify.com' jaisi galat guesses reject hoti hain.
+    Domain ko akela saboot nahi mana jata kyunke domain naam se hi guess hua tha."""
+    full, core, tokens = name_keys(store_name)
+    if not full and not core:
+        return True
+
+    identity = page_identity_text(html)
+    hay = norm(identity)
+    id_tokens = set(re.findall(r"[a-z0-9]+", identity.lower()))
+
+    def hit(key):
+        if not key:
+            return False
+        if len(key) >= 4:
+            return key in hay
+        return key in id_tokens          # chhote naam: poora word match hona chahiye
+
+    if hit(core) or hit(full):
+        return True
+    if tokens and all(t in hay for t in tokens):
+        return True
+
+    # Custom domain (myshopify nahi) jo brand name se milta ho — title generic ho tab bhi.
+    if not final_domain.endswith(".myshopify.com"):
+        label = domain_label(final_domain)
+        for key in (core, full):
+            if key and len(key) >= 4 and (key in label or (len(label) >= 4 and label in key)):
+                return True
+    return False
+
+
 def detect_theme(html):
     if not html:
         return "Unknown"
-    text = html.lower()
-    themes = [
-        "dawn", "refresh", "sense", "craft", "ride", "taste", "origin",
-        "publisher", "spotlight", "studio", "crave", "colorblock",
-        "be yours", "impulse", "prestige", "warehouse", "motion", "debut",
-    ]
-    for theme in themes:
-        if theme in text:
-            return theme.title()
-    match = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html, re.I)
-    if match:
-        return match.group(1)
+    block = re.search(r'Shopify\.theme\s*=\s*(\{[^}]*\})', html)
+    if block:
+        for key in ("schema_name", "name"):
+            m = re.search(r'"%s"\s*:\s*"([^"]+)"' % key, block.group(1))
+            if m:
+                return m.group(1)
+    m = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html, re.I)
+    if m:
+        return m.group(1)
     return "Unknown"
 
 
 def get_product_count(base_url):
     url = base_url.rstrip("/") + "/products.json?limit=250"
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             return 0
-        data = response.json()
-        return len(data.get("products", []))
+        return len(response.json().get("products", []))
     except Exception:
         return 0
 
 
 # ============================================================
-# EMAIL EXTRACTION
+# EMAIL EXTRACTION (mandatory for every lead)
 # ============================================================
 
-EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+EMAIL_REGEX = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}", re.I)
+MAILTO_REGEX = re.compile(r'mailto:([^"\'?\s<>&]+)', re.I)
+CF_EMAIL_REGEX = re.compile(r'data-cfemail="([0-9a-f]+)"|email-protection#([0-9a-f]+)', re.I)
+OBFUSCATED_AT = re.compile(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", re.I)
+OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
+
+JUNK_EMAIL_DOMAINS = (
+    "example.com", "domain.com", "yourdomain.com", "yourstore.com", "email.com",
+    "mysite.com", "mydomain.com", "test.com", "sentry.io", "wixpress.com",
+    "shopify.com", "myshopify.com", "shopifyapps.com", "shopifycloud.com",
+    "klaviyo.com", "cloudflare.com", "schema.org", "w3.org", "apple.com",
+    "google.com", "googleapis.com", "gstatic.com", "facebook.com", "twitter.com",
+    "instagram.com", "paypal.com", "godaddy.com", "judge.me", "loox.io",
+    "privy.com", "smile.io", "recart.com", "gorgias.com", "zendesk.com",
+    "freshdesk.com", "intercom.io", "mailchimp.com", "hubspot.com", "wix.com",
+    "squarespace.com", "wordpress.com", "jsdelivr.net", "cloudfront.net",
+)
+JUNK_LOCALPARTS = {
+    "noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon",
+    "postmaster", "john.doe", "jane.doe", "your.name", "yourname", "name",
+    "email", "user", "username", "someone", "example", "test",
+}
+BAD_TLDS = {
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "css", "js", "woff", "woff2",
+    "ttf", "eot", "ico", "mp4", "json", "map", "php", "html",
+}
+FREE_PROVIDERS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "outlook.com",
+    "hotmail.com", "hotmail.co.uk", "live.com", "msn.com", "icloud.com",
+    "me.com", "aol.com", "proton.me", "protonmail.com", "gmx.com", "mail.com",
+    "zoho.com",
+}
+PREFERRED_LOCALPARTS = (
+    "info", "contact", "hello", "support", "care", "sales", "help", "team",
+    "customercare", "customerservice", "orders", "shop", "admin",
+)
 
 
-def extract_emails(text):
-    if not text:
-        return []
-    emails = EMAIL_REGEX.findall(text)
-    cleaned = []
-    bad_ext = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-    for email in emails:
-        email = email.lower().strip()
-        if email.endswith(bad_ext):
+def clean_email(raw):
+    e = html_lib.unescape(raw).strip().strip(".,;:'\"<>()[]").lower()
+    return re.sub(r"^(u003e|u003c)", "", e)
+
+
+def is_valid_email(e):
+    if e.count("@") != 1 or len(e) > 80 or ".." in e:
+        return False
+    local, domain = e.split("@")
+    if not local or not domain or local in JUNK_LOCALPARTS:
+        return False
+    if domain.rsplit(".", 1)[-1] in BAD_TLDS:
+        return False
+    return not any(domain == bad or domain.endswith("." + bad) for bad in JUNK_EMAIL_DOMAINS)
+
+
+def decode_cf_email(hex_str):
+    try:
+        key = int(hex_str[:2], 16)
+        return "".join(chr(int(hex_str[i:i + 2], 16) ^ key) for i in range(2, len(hex_str), 2))
+    except Exception:
+        return ""
+
+
+def collect_emails(raw_text):
+    """Returns {email: trusted_bool} (trusted = mailto / Cloudflare-decoded)."""
+    found = {}
+    if not raw_text:
+        return found
+
+    def add(candidate, trusted):
+        e = clean_email(candidate)
+        if e and is_valid_email(e):
+            found[e] = found.get(e, False) or trusted
+
+    for match in MAILTO_REGEX.findall(raw_text):
+        for part in unquote(match).split(","):
+            add(part, True)
+
+    for m in CF_EMAIL_REGEX.finditer(raw_text):
+        add(decode_cf_email(m.group(1) or m.group(2)), True)
+
+    text = html_lib.unescape(raw_text)
+    text = OBFUSCATED_AT.sub("@", text)
+    text = OBFUSCATED_DOT.sub(".", text)
+    for match in EMAIL_REGEX.findall(text):
+        add(match, False)
+
+    return found
+
+
+def domain_label(d):
+    parts = d.split(".")
+    if d.endswith(".myshopify.com"):
+        return norm(parts[0])
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in {"co", "com", "org", "net", "gov", "ac", "edu"}:
+        return norm(parts[-3])
+    if len(parts) >= 2:
+        return norm(parts[-2])
+    return norm(parts[0])
+
+
+def is_related(email_domain, store_domain, keys):
+    if (email_domain == store_domain or email_domain.endswith("." + store_domain)
+            or store_domain.endswith("." + email_domain)):
+        return True
+    a, b = domain_label(email_domain), domain_label(store_domain)
+    if not a:
+        return False
+    if a == b:
+        return True
+    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+        return True
+    for k in keys:
+        if len(k) >= 4 and (k in a or (len(a) >= 4 and a in k)):
+            return True
+    return False
+
+
+def rank_emails(found, store_domain, store_name):
+    """Best email pehle. Store se unrelated (aur free-provider bhi nahi, aur mailto
+    bhi nahi) emails — jaise theme/agency/plugin wali — drop ho jati hain."""
+    full, core, _ = name_keys(store_name)
+    keys = [k for k in (core, full) if k]
+
+    scored = []
+    for order, (email, trusted) in enumerate(found.items()):
+        local, dom = email.split("@")
+        related = is_related(dom, store_domain, keys)
+        free = dom in FREE_PROVIDERS
+        if not related and not free and not trusted:
             continue
-        if email not in cleaned:
-            cleaned.append(email)
-    return cleaned
+        score = 0
+        if related:
+            score += 3
+        if trusted:
+            score += 2
+        if local in PREFERRED_LOCALPARTS:
+            score += 1
+        scored.append((-score, order, email))
+
+    scored.sort()
+    return [e for _, _, e in scored]
 
 
-MAILTO_REGEX = re.compile(r'mailto:([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})', re.I)
+@lru_cache(maxsize=50000)
+def domain_has_mx(domain):
+    """Bounce se bachne ke liye: domain email receive kar sakta hai? (dnspython ho tabhi)."""
+    if not (VERIFY_MX and DNS_AVAILABLE):
+        return True
+    try:
+        dns.resolver.resolve(domain, "MX", lifetime=4)
+        return True
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+        return False
+    except dns.resolver.NoAnswer:
+        try:
+            dns.resolver.resolve(domain, "A", lifetime=4)
+            return True
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+            return False
+        except Exception:
+            return True
+    except Exception:
+        return True   # timeout waghera — transient error par email drop nahi karte
 
 
-def extract_mailto_emails(html):
-    """
-    mailto: links are near-certain to be a real contact email (vs random
-    strings from analytics/CDN scripts that trip up a plain regex scan),
-    so we check these first and trust them most.
-    """
-    if not html:
-        return []
-
-    matches = MAILTO_REGEX.findall(html)
-    cleaned = []
-    for email in matches:
-        email = email.lower().strip()
-        if email not in cleaned:
-            cleaned.append(email)
-    return cleaned
+def discover_contact_links(html, base_url):
+    links = []
+    base_netloc = urlparse(base_url).netloc
+    for href in re.findall(r'href=["\']([^"\'#]+)["\']', html or "", re.I):
+        if not any(k in href.lower() for k in ("contact", "about", "support", "help")):
+            continue
+        parsed = urlparse(urljoin(base_url, href))
+        path = parsed.path
+        if parsed.netloc != base_netloc or not path or path == "/":
+            continue
+        if any(x in path for x in ("/products/", "/collections/", "/cdn/")):
+            continue
+        if path.endswith((".jpg", ".png", ".css", ".js", ".svg", ".webp", ".pdf")):
+            continue
+        links.append(path)
+    return list(dict.fromkeys(links))[:4]
 
 
 def fetch_extra_pages(base_url, homepage_html):
-    """
-    Fetches contact/about/policy/support pages ONCE and returns the combined
-    text. This combined text is then reused for BOTH email extraction and
-    feature detection (FAQ/Testimonials/etc.) — previously feature detection
-    only looked at the homepage, which missed sections that live on their
-    own page (a very common Shopify pattern).
-    """
+    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se."""
     pages = [
-        "/contact",
-        "/pages/contact",
-        "/pages/contact-us",
-        "/pages/get-in-touch",
-        "/about",
-        "/pages/about",
-        "/pages/faq",
-        "/pages/faqs",
-        "/pages/support",
-        "/support",
-        "/help",
-        "/policies/contact-information",
-        "/policies/privacy-policy",
-        "/policies/refund-policy",
+        "/pages/contact", "/pages/contact-us", "/contact", "/pages/get-in-touch",
+        "/pages/about", "/about", "/pages/about-us", "/pages/faq", "/pages/support",
+        "/policies/contact-information", "/policies/refund-policy",
+        "/policies/shipping-policy", "/policies/privacy-policy",
         "/policies/terms-of-service",
     ]
+    pages += discover_contact_links(homepage_html, base_url)
+    pages = list(dict.fromkeys(pages))[:18]
 
-    combined_text = homepage_html or ""
-
+    combined = homepage_html or ""
     for path in pages:
         try:
-            html, _ = fetch_page(base_url.rstrip("/") + path)
-            if html:
-                combined_text += "\n" + html
+            page_html, _ = fetch_page(base_url.rstrip("/") + path)
+            if page_html:
+                combined += "\n" + page_html
         except Exception:
             pass
-
-    return combined_text
-
-
-def guess_email_patterns(domain):
-    """
-    When no real email is found on the site, offer common pattern-based
-    guesses as a starting point. These are UNVERIFIED — clearly separated
-    into their own column so they're never confused with a confirmed email.
-    Verify before using for outreach (e.g. with an email-verification tool)
-    to avoid bounces.
-    """
-    if not domain:
-        return ""
-    prefixes = ["info", "contact", "support", "hello", "sales"]
-    return ", ".join(f"{p}@{domain}" for p in prefixes[:3])
-
-
-def find_email(combined_text):
-    # mailto: links are near-certain to be a real contact email — check first.
-    mailto_hits = extract_mailto_emails(combined_text)
-    if mailto_hits:
-        return mailto_hits[0]
-
-    # Fall back to a plain-text scan across everything fetched.
-    emails = extract_emails(combined_text)
-    return emails[0] if emails else ""
+    return combined
 
 
 # ============================================================
-# FEATURE DETECTION
+# FEATURE DETECTION + SCORING
 # ============================================================
 
 def has_any(text, keywords):
@@ -719,10 +712,6 @@ def detect_features(html):
         "Instagram": has_any(text, ["instagram.com", "instagram-feed"]),
     }
 
-
-# ============================================================
-# REASON ENGINE + SCORE
-# ============================================================
 
 def build_reasons(theme, product_count, features, email):
     reasons, recommendations = [], []
@@ -778,8 +767,8 @@ def calculate_score(product_count, features, email, theme):
         score += 5
 
     for key, pts in [("FAQ", 10), ("Testimonials", 10), ("Reviews", 10),
-                      ("Sticky Add To Cart", 10), ("Size Guide", 5),
-                      ("Newsletter", 5), ("WhatsApp", 5)]:
+                     ("Sticky Add To Cart", 10), ("Size Guide", 5),
+                     ("Newsletter", 5), ("WhatsApp", 5)]:
         if not features[key]:
             score += pts
 
@@ -800,50 +789,64 @@ def score_quality(score):
 
 
 # ============================================================
-# ANALYZE STORE
+# ANALYZE ONE DOMAIN  ->  (status, data)
+#   ok / no_email / not_shopify / password / name_mismatch / no_products / error
 # ============================================================
 
-def analyze_store(domain, source):
-    base_url = normalize_url(domain)
-
+def analyze_store(domain, store_name, source_app):
     try:
-        html, final_url = fetch_page(base_url)
-        if not html:
-            return None
-
-        if not detect_shopify(html):
-            return None
+        html, final_url = fetch_page(normalize_url(domain))
+        if not html or not detect_shopify(html):
+            return "not_shopify", None
 
         final_domain = normalize_domain(final_url)
         if not final_domain or is_bad_domain(final_domain):
-            return None
+            return "not_shopify", None
 
-        theme = detect_theme(html)
+        if is_password_page(html, final_url):
+            return "password", None
+
+        if STRICT_NAME_MATCH and not name_matches_page(store_name, final_domain, html):
+            return "name_mismatch", None
+
+        base_url = normalize_url(final_url)
+
         product_count = get_product_count(base_url)
+        if product_count < MIN_PRODUCTS:
+            return "no_products", None
 
-        # Fetch contact/about/policy/support pages ONCE and reuse the
-        # combined text for both email extraction and feature detection —
-        # this is the "properly visit and analyze the site" pass, instead
-        # of judging FAQ/Testimonials/etc. off the homepage alone.
         combined_text = fetch_extra_pages(base_url, html)
 
-        email = find_email(combined_text)
-        email_guessed = guess_email_patterns(final_domain) if not email else ""
+        ranked = rank_emails(collect_emails(combined_text), final_domain, store_name)
+        email = next((e for e in ranked if domain_has_mx(e.split("@")[1])), "")
 
+        source = f"App Store reviews: {source_app}"
+
+        if not email:
+            return "no_email", {
+                "Store Name": store_name,
+                "Store URL": base_url,
+                "Domain": final_domain,
+                "Products": product_count,
+                "Source": source,
+            }
+
+        other_emails = [e for e in ranked if e != email][:3]
+        theme = detect_theme(html)
         features = detect_features(combined_text)
         reasons, recommendations = build_reasons(theme, product_count, features, email)
         score = calculate_score(product_count, features, email, theme)
-        quality = score_quality(score)
 
-        return {
+        return "ok", {
+            "Store Name": store_name,
             "Store URL": base_url,
             "Domain": final_domain,
-            "Theme": theme,
             "Email": email,
-            "Email (Guessed)": email_guessed,
+            "Other Emails": ", ".join(other_emails),
+            "Theme": theme,
             "Products": product_count,
             "Lead Score": score,
-            "Quality": quality,
+            "Quality": score_quality(score),
             "FAQ": "YES" if features["FAQ"] else "NO",
             "Testimonials": "YES" if features["Testimonials"] else "NO",
             "Reviews": "YES" if features["Reviews"] else "NO",
@@ -853,171 +856,141 @@ def analyze_store(domain, source):
             "WhatsApp": "YES" if features["WhatsApp"] else "NO",
             "Reason": " | ".join(reasons),
             "Recommended Sections": ", ".join(recommendations),
-            "Search Query": source,
+            "Source": source,
         }
 
     except Exception as e:
         logger.debug("Store analysis failed %s: %s", domain, str(e))
-        return None
+        return "error", None
+
+
+def process_store_name(name, handle, guesses):
+    """Ek store name ke saare domain guesses sequentially try karta hai aur
+    pehli asli hit (ok ya no_email) par ruk jata hai — duplicates + faltu requests khatam.
+    Returns (status, data, reasons_counter)."""
+    reasons = Counter()
+    for domain in guesses:
+        status, data = analyze_store(domain, name, handle)
+        if status in ("ok", "no_email"):
+            return status, data, reasons
+        reasons[status] += 1
+    return "not_found", None, reasons
 
 
 # ============================================================
-# GOOGLE SHEETS (OPTIONAL)
+# GOOGLE SHEETS  (user-created sheet + service account Editor access)
 # ============================================================
 
-HEADERS = [
-    "Store URL", "Domain", "Theme", "Email", "Email (Guessed)", "Products", "Lead Score",
-    "Quality", "FAQ", "Testimonials", "Reviews", "Sticky Add To Cart",
-    "Size Guide", "Newsletter", "WhatsApp", "Reason",
-    "Recommended Sections", "Search Query",
-]
+def parse_sheet_id(value):
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", value)
+    return m.group(1) if m else value.strip()
 
 
-def load_created_sheet_id():
-    """A sheet auto-created on a previous run — reuse it so we don't spin
-    up a brand new spreadsheet every single day."""
-    if not os.path.exists(CREATED_SHEET_ID_FILE):
-        return ""
+def get_or_create_tab(spreadsheet, title, headers):
+    """Tab (worksheet) tayyar karta hai. Purane columns wali tab rename ho jati hai (data safe)."""
     try:
-        with open(CREATED_SHEET_ID_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
+        ws = spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        sheets = spreadsheet.worksheets()
+        if len(sheets) == 1 and not sheets[0].row_values(1) and title == SHEET_NAME:
+            ws = sheets[0]                       # nayi sheet ka khali default tab reuse
+            ws.update_title(title)
+        else:
+            ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+
+    header = ws.row_values(1)
+    if header == headers:
+        return ws
+
+    if header:
+        old_title = f"{title}_old_{time.strftime('%Y%m%d_%H%M%S')}"
+        ws.update_title(old_title)
+        logger.warning("Tab '%s' ke columns purane the — '%s' naam se save, nayi tab ban rahi hai.", title, old_title)
+        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+
+    ws.update(values=[headers], range_name="A1")
+    try:
+        ws.freeze(rows=1)
     except Exception:
-        return ""
+        pass
+    return ws
 
 
-def save_created_sheet_id(sheet_id):
-    ensure_data_dir()
-    try:
-        with open(CREATED_SHEET_ID_FILE, "w", encoding="utf-8") as f:
-            f.write(sheet_id)
-    except Exception as e:
-        logger.error("Could not save created_sheet_id.txt: %s", str(e))
-
-
-def create_new_sheet(client):
-    logger.info("Creating a brand new Google Sheet for leads...")
-
-    spreadsheet = client.create("Shopify Leads")
-
-    if GOOGLE_SHARE_WITH_EMAIL:
-        try:
-            spreadsheet.share(GOOGLE_SHARE_WITH_EMAIL, perm_type="user", role="writer")
-            logger.info("Shared new sheet with: %s", GOOGLE_SHARE_WITH_EMAIL)
-        except Exception as e:
-            logger.error(
-                "Could not share the new sheet with %s: %s — it still exists "
-                "but only the service account can see it until you share it "
-                "manually from the service account's Drive, or set "
-                "GOOGLE_SHARE_WITH_EMAIL and rerun.",
-                GOOGLE_SHARE_WITH_EMAIL, str(e)
-            )
-    else:
-        logger.warning(
-            "GOOGLE_SHARE_WITH_EMAIL is not set — the new sheet was created "
-            "but is only visible to the service account, not to you. Set "
-            "GOOGLE_SHARE_WITH_EMAIL=<your-gmail-address> as a secret and "
-            "rerun so it gets shared automatically."
-        )
-
-    save_created_sheet_id(spreadsheet.id)
-
-    logger.info("=" * 70)
-    logger.info("NEW GOOGLE SHEET CREATED")
-    logger.info("URL: %s", spreadsheet.url)
-    logger.info("=" * 70)
-
-    return spreadsheet
-
-
-def connect_sheet():
+def connect_sheets():
+    """Returns (leads_ws, no_email_ws) ya (None, None)."""
     if not GSPREAD_AVAILABLE:
-        logger.warning(
-            "Google Sheet output skipped: gspread/google-auth not installed. "
-            "Run: pip install gspread google-auth"
-        )
-        return None
-
+        logger.error("Run: pip install gspread google-auth")
+        return None, None
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        logger.warning(
-            "Google Sheet output skipped: GOOGLE_SERVICE_ACCOUNT_JSON env var "
-            "is not set. Leads will still be saved to the local CSV."
+        logger.error("GOOGLE_SERVICE_ACCOUNT_JSON env var set nahi hai.")
+        return None, None
+    if not GOOGLE_SHEET_ID:
+        logger.error(
+            "GOOGLE_SHEET_ID set nahi hai. Service account khud sheet create nahi kar sakta "
+            "(403 'Drive storage quota exceeded'). Fix: (1) apne Google Drive me ek khali sheet "
+            "banayein, (2) usay service account ki email par Editor share karein, (3) sheet ka "
+            "URL ya ID GOOGLE_SHEET_ID me daal dein."
         )
-        return None
+        return None, None
 
+    client_email = "?"
     try:
-        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        client_email = info.get("client_email", "?")
+        credentials = Credentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
         client = gspread.authorize(credentials)
+        logger.info("Service account: %s", client_email)
 
-        # Priority: explicit GOOGLE_SHEET_ID env var -> a sheet we already
-        # auto-created on a previous run -> create a brand new one.
-        sheet_id = GOOGLE_SHEET_ID or load_created_sheet_id()
+        spreadsheet = client.open_by_key(parse_sheet_id(GOOGLE_SHEET_ID))
+        logger.info("Connected to Google Sheet: %s", spreadsheet.url)
 
-        spreadsheet = None
-        if sheet_id:
-            try:
-                spreadsheet = client.open_by_key(sheet_id)
-                logger.info("Connected to existing Google Sheet successfully.")
-            except Exception as e:
-                logger.warning(
-                    "Could not open sheet ID %s (%s) — creating a new one instead.",
-                    sheet_id, str(e)
-                )
-                spreadsheet = None
-
-        if spreadsheet is None:
-            spreadsheet = create_new_sheet(client)
-
-        try:
-            worksheet = spreadsheet.worksheet(SHEET_NAME)
-        except Exception:
-            worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADERS))
-
-        return worksheet
+        leads_ws = get_or_create_tab(spreadsheet, SHEET_NAME, HEADERS)
+        no_email_ws = get_or_create_tab(spreadsheet, NO_EMAIL_SHEET_NAME, NO_EMAIL_HEADERS)
+        return leads_ws, no_email_ws
 
     except json.JSONDecodeError:
+        logger.error("GOOGLE_SERVICE_ACCOUNT_JSON valid JSON nahi — key file ka poora content paste karein, path nahi.")
+    except gspread.exceptions.SpreadsheetNotFound:
         logger.error(
-            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the full "
-            "contents of the service account key file, not a file path."
+            "Sheet nahi mili ya share nahi hui. Sheet ko %s par Editor share karein "
+            "aur GOOGLE_SHEET_ID check karein.", client_email
         )
-        return None
     except Exception as e:
         logger.error(
-            "Google Sheet connection failed: %s | Common causes: (1) Sheets/"
-            "Drive API not enabled on that Google Cloud project, (2) the "
-            "service account has no Drive storage quota (rare, but happens "
-            "on some restricted accounts).",
-            str(e)
+            "Google Sheet connection failed: %s | Check: Sheets API + Drive API enable hain? "
+            "Sheet %s ko Editor share hui?", str(e), client_email
         )
-        return None
+    return None, None
 
 
-def setup_headers(worksheet):
+def load_tab_column(ws, headers, column_name):
     try:
-        current = worksheet.row_values(1)
-        if current != HEADERS:
-            worksheet.update(values=[HEADERS], range_name="A1")
+        idx = headers.index(column_name) + 1
+        return [v.strip() for v in ws.col_values(idx)[1:] if v.strip()]
     except Exception as e:
-        logger.error("Could not update headers: %s", str(e))
+        logger.warning("Could not read '%s' from sheet: %s", column_name, str(e))
+        return []
 
 
-def row_from_lead(lead):
-    return [lead.get(h, "") for h in HEADERS]
-
-
-def save_leads_to_sheet(worksheet, leads):
-    if not leads:
+def save_rows_to_sheet(ws, headers, records, label):
+    if not ws or not records:
         return
-    rows = [row_from_lead(lead) for lead in leads]
-    try:
-        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
-        logger.info("Saved %s leads to Google Sheet.", len(rows))
-    except Exception as e:
-        logger.error("Could not save leads to sheet: %s", str(e))
+    rows = [[r.get(h, "") for h in headers] for r in records]
+    for attempt in range(4):
+        try:
+            ws.append_rows(rows, value_input_option="RAW")   # RAW: '=...' wale naam formula nahi banenge
+            logger.info("Saved %s rows to Google Sheet tab '%s'.", len(rows), label)
+            return
+        except Exception as e:
+            logger.error("Sheet save attempt %s failed (%s): %s", attempt + 1, label, str(e))
+            time.sleep(5 * (attempt + 1))
+    logger.error("Sheet me save nahi ho saka (%s) — in rows ki copy local CSV me hai.", label)
 
 
 # ============================================================
@@ -1026,118 +999,152 @@ def save_leads_to_sheet(worksheet, leads):
 
 def main():
     logger.info("=" * 70)
-    logger.info("SHOPIFY LEAD INTELLIGENCE ENGINE — FREE / HIGH VOLUME")
+    logger.info("SHOPIFY LEAD FINDER v2 — App Store reviews only | email mandatory")
     logger.info("=" * 70)
 
-    seen_domains = load_seen_domains()
-    logger.info("Previously seen domains (will skip): %s", len(seen_domains))
+    ensure_data_dir()
+    ensure_csv_schema_matches(LEADS_CSV_FILE, HEADERS)
+    ensure_csv_schema_matches(NO_EMAIL_CSV_FILE, NO_EMAIL_HEADERS)
 
-    # --------------------------------------------------------
-    # DISCOVERY
-    # --------------------------------------------------------
-    cc_domains = discover_via_common_crawl()
-    google_domains = discover_via_google()
-    app_store_domains = discover_via_app_store_reviews()
+    # Sheet pehle connect hoti hai — masla ho to scraping se pehle pata chal jaye.
+    leads_ws, no_email_ws = connect_sheets()
+    if leads_ws is None:
+        if REQUIRE_SHEET:
+            logger.error("Sheet connect nahi hui, isliye run ruk gaya (REQUIRE_SHEET=0 set karein to CSV-only chalega).")
+            sys.exit(1)
+        logger.warning("Sheet ke baghair CSV-only mode me chal raha hun: %s", LEADS_CSV_FILE)
 
-    all_discovered = cc_domains | google_domains | app_store_domains
-    logger.info(
-        "Discovery breakdown -> Common Crawl: %s | Google CSE: %s | "
-        "App Store name-guesses: %s | Combined unique: %s",
-        len(cc_domains), len(google_domains), len(app_store_domains), len(all_discovered)
-    )
+    # ---------------- Already-processed data ----------------
+    seen = load_seen()                       # entries: "name:<normalized store name>"
+    found_final_domains = set()
 
-    new_domains = [d for d in all_discovered if d not in seen_domains and not is_bad_domain(d)]
-    logger.info("New unseen candidate domains: %s", len(new_domains))
+    if leads_ws is not None:
+        lead_domains = load_tab_column(leads_ws, HEADERS, "Domain")
+        lead_names = load_tab_column(leads_ws, HEADERS, "Store Name")
+        ne_domains = load_tab_column(no_email_ws, NO_EMAIL_HEADERS, "Domain")
+        ne_names = load_tab_column(no_email_ws, NO_EMAIL_HEADERS, "Store Name")
+        found_final_domains |= {d.lower() for d in lead_domains + ne_domains}
+        seen |= {f"name:{norm(n)}" for n in lead_names + ne_names}
+        logger.info("Sheet me pehle se: %s leads, %s no-email stores", len(lead_domains), len(ne_domains))
 
-    if not new_domains:
-        logger.warning("No new domains discovered this run. Try again later or widen CC_URL_PATTERN.")
+    logger.info("Already processed store names (will skip): %s", len(seen))
+
+    # ---------------- DISCOVERY ----------------
+    names = discover_store_names()
+
+    todo = []
+    for name, handle in names.items():
+        key = f"name:{norm(name)}"
+        if key in seen:
+            continue
+        guesses = [d for d in guess_domains_from_name(name) if not is_bad_domain(d)]
+        if guesses:
+            todo.append((name, handle, guesses))
+
+    logger.info("New store names to analyze: %s", len(todo))
+    if not todo:
+        logger.warning("Koi naya store name nahi mila. Baad me try karein ya APP_STORE_HANDLES badhayein.")
         logger.info("RUN COMPLETE")
         return
 
-    candidates = new_domains[:MAX_DOMAINS_PER_RUN]
-    logger.info("Analyzing %s candidates this run (cap: %s)", len(candidates), MAX_DOMAINS_PER_RUN)
+    todo = todo[:MAX_NAMES_PER_RUN]
+    logger.info("Analyzing %s store names this run (cap: %s)", len(todo), MAX_NAMES_PER_RUN)
 
-    # --------------------------------------------------------
-    # CONNECT TO SHEET ONCE, UP FRONT — not just at the very end.
-    # This was the bug causing "sheet not created": the old code only
-    # tried to save to Sheets after the full analysis loop finished, using
-    # only whatever leads were left over after the last 200-checkpoint.
-    # If the count landed exactly on a multiple of 200, Sheets never got
-    # called at all. Now we connect once and write to BOTH CSV and Sheet
-    # at every checkpoint.
-    # --------------------------------------------------------
-    worksheet = connect_sheet()
-    if worksheet:
-        setup_headers(worksheet)
-    else:
-        logger.info(
-            "Continuing with CSV-only output this run — leads will be in %s",
-            LEADS_CSV_FILE
-        )
+    # ---------------- ANALYSIS ----------------
+    leads, no_email_rows = [], []
+    stats = Counter()
+    reason_stats = Counter()
+    completed = 0
 
-    # --------------------------------------------------------
-    # ANALYSIS
-    # --------------------------------------------------------
-    leads = []
-    processed_domains = set()
-    total_leads_found = 0
+    def flush():
+        nonlocal leads, no_email_rows
+        if leads:
+            append_csv(LEADS_CSV_FILE, HEADERS, leads)
+            save_rows_to_sheet(leads_ws, HEADERS, leads, SHEET_NAME)
+            leads = []
+        if no_email_rows:
+            append_csv(NO_EMAIL_CSV_FILE, NO_EMAIL_HEADERS, no_email_rows)
+            save_rows_to_sheet(no_email_ws, NO_EMAIL_HEADERS, no_email_rows, NO_EMAIL_SHEET_NAME)
+            no_email_rows = []
+        save_seen(seen)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
         futures = {
-            executor.submit(analyze_store, domain, "common_crawl_or_google"): domain
-            for domain in candidates
+            executor.submit(process_store_name, name, handle, guesses): name
+            for name, handle, guesses in todo
         }
 
-        completed = 0
         for future in as_completed(futures):
-            domain = futures[future]
+            name = futures[future]
             completed += 1
-            processed_domains.add(domain)
 
             try:
-                lead = future.result()
-                if lead:
-                    leads.append(lead)
-                    total_leads_found += 1
-                    logger.info(
-                        "[%s/%s] LEAD: %s | %s | Score %s",
-                        completed, len(candidates),
-                        lead["Domain"], lead["Quality"], lead["Lead Score"]
-                    )
+                status, data, reasons = future.result()
             except Exception as e:
-                logger.error("Analysis error for %s: %s", domain, str(e))
+                logger.error("Analysis error for %s: %s", name, str(e))
+                status, data, reasons = "not_found", None, Counter({"error": 1})
+
+            reason_stats.update(reasons)
+
+            # Transient errors wale names ko 'seen' nahi banate taake agli run me dobara try hon.
+            if not reasons.get("error"):
+                seen.add(f"name:{norm(name)}")
+
+            if status == "ok":
+                domain = data["Domain"].lower()
+                if domain in found_final_domains:
+                    stats["duplicate"] += 1
+                else:
+                    found_final_domains.add(domain)
+                    leads.append(data)
+                    stats["leads"] += 1
+                    logger.info(
+                        "[%s/%s] LEAD: %s | %s | %s | Score %s",
+                        completed, len(todo), data["Domain"], data["Email"],
+                        data["Quality"], data["Lead Score"]
+                    )
+            elif status == "no_email":
+                domain = data["Domain"].lower()
+                if domain in found_final_domains:
+                    stats["duplicate"] += 1
+                else:
+                    found_final_domains.add(domain)
+                    no_email_rows.append(data)
+                    stats["no_email"] += 1
+            else:
+                stats["not_found"] += 1
 
             if completed % CHECKPOINT_INTERVAL == 0:
-                seen_domains |= processed_domains
-                save_seen_domains(seen_domains)
+                flush()
+                logger.info("Checkpoint saved at %s/%s.", completed, len(todo))
 
-                if leads:
-                    append_leads_csv(leads)
-                    if worksheet:
-                        save_leads_to_sheet(worksheet, leads)
-                    leads = []
-
-                logger.info("Checkpoint saved at %s processed.", completed)
-
-    # --------------------------------------------------------
-    # FINAL SAVE (whatever is left since the last checkpoint)
-    # --------------------------------------------------------
-    seen_domains |= processed_domains
-    save_seen_domains(seen_domains)
-
-    if leads:
+    except KeyboardInterrupt:
+        logger.warning("Interrupted — ab tak ka data save kar raha hun...")
+        executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        executor.shutdown(wait=False)
         leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
-        append_leads_csv(leads)
-        if worksheet:
-            save_leads_to_sheet(worksheet, leads)
+        flush()
 
+    # ---------------- SUMMARY ----------------
     logger.info("=" * 70)
     logger.info("RUN COMPLETE")
-    logger.info("Candidates analyzed: %s", len(candidates))
-    logger.info("Total leads found this run: %s", total_leads_found)
-    logger.info("All leads this run saved to: %s", LEADS_CSV_FILE)
-    if worksheet:
-        logger.info("Leads also saved to Google Sheet: %s", SHEET_NAME)
+    logger.info("Store names analyzed: %s", completed)
+    logger.info("LEADS saved (real email found): %s", stats["leads"])
+    logger.info("Shopify stores but NO email (-> '%s' tab): %s", NO_EMAIL_SHEET_NAME, stats["no_email"])
+    logger.info("Names jinka koi valid store nahi mila: %s", stats["not_found"])
+    logger.info("Duplicates skipped: %s", stats["duplicate"])
+    if reason_stats:
+        logger.info(
+            "Guesses reject hone ki wajah -> not_shopify: %s | password: %s | "
+            "name_mismatch: %s | no_products: %s | error: %s",
+            reason_stats["not_shopify"], reason_stats["password"],
+            reason_stats["name_mismatch"], reason_stats["no_products"], reason_stats["error"]
+        )
+    logger.info("CSV backup: %s", LEADS_CSV_FILE)
+    if leads_ws is not None:
+        logger.info("Google Sheet tab: %s", SHEET_NAME)
     logger.info("=" * 70)
 
 
