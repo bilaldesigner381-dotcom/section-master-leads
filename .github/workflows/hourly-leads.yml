@@ -1,42 +1,37 @@
-name: Daily Shopify Lead Finder
+# Is file ko repo me is path par rakhein:  .github/workflows/lead-finder.yml
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   GOOGLE_SERVICE_ACCOUNT_JSON  = service account key ka poora JSON
+#   GOOGLE_SHEET_ID              = sheet ka URL ya ID (sheet service account ko Editor share ho)
+
+name: Shopify Lead Finder (hourly)
 
 on:
   schedule:
-    # Runs at 06:00 UTC every day (~11 AM Pakistan time). Edit the cron
-    # expression to change the time. GitHub Actions cron times are always UTC.
-    - cron: "0 6 * * *"
-  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+    - cron: "17 * * * *"      # har ghante, 17 minute par
+  workflow_dispatch:           # manual run button
+
+concurrency:
+  group: lead-finder           # pichli run chal rahi ho to naya run overlap nahi karega
+  cancel-in-progress: false
 
 jobs:
-  run-lead-finder:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # safety cap so a stuck run doesn't burn your quota
-
+    timeout-minutes: 58
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 gspread google-auth
+        run: pip install requests beautifulsoup4 gspread google-auth dnspython
 
       - name: Run lead finder
+        run: python shopify_lead_finder_v3.py
         env:
-          # These come from your repo's Settings -> Secrets and variables -> Actions
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: python shopify_lead_finder.py
-
-      - name: Commit updated lead data back to the repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add lead_data/
-          git diff --staged --quiet || git commit -m "Daily lead run: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          RUN_TIME_BUDGET_MINUTES: "45"
+          NAMES_TARGET_PER_RUN: "2500"
