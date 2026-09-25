@@ -103,6 +103,8 @@ RUN_EVERY_MINUTES = float(os.environ.get("RUN_EVERY_MINUTES", "60"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "100"))
+STORE_TIME_BUDGET_SECONDS = float(os.environ.get("STORE_TIME_BUDGET_SECONDS", "25"))
+HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", "30"))
 
 # --- Quality filters ---
 MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))
@@ -741,7 +743,10 @@ def detect_theme(html):
 def get_product_count(base_url):
     url = base_url.rstrip("/") + "/products.json?limit=250"
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=REQUEST_TIMEOUT)
+        response = requests.get(
+            url, headers={"User-Agent": "Mozilla/5.0"},
+            timeout=(min(REQUEST_TIMEOUT, 6), REQUEST_TIMEOUT),
+        )
         if response.status_code != 200:
             return 0
         return len(response.json().get("products", []))
@@ -936,8 +941,12 @@ def discover_contact_links(html, base_url):
     return list(dict.fromkeys(links))[:4]
 
 
-def fetch_extra_pages(base_url, homepage_html):
-    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se."""
+def fetch_extra_pages(base_url, homepage_html, deadline=None):
+    """Contact/about/policy pages fetch — email + feature detection dono isi se.
+    Speedup + safety: (1) trusted email (mailto/Cloudflare) milte hi ruk jata hai,
+    baqi pages fetch nahi hoti — zyadatar stores 1-2 pages ke baad hi mil jati hain.
+    (2) deadline diya ho to har page se pehle check hota hai, taake ek slow store
+    baqi 25 workers ke saath poora run atka na sake."""
     pages = [
         "/pages/contact", "/pages/contact-us", "/contact", "/pages/get-in-touch",
         "/pages/about", "/about", "/pages/about-us", "/pages/faq", "/pages/support",
@@ -946,14 +955,21 @@ def fetch_extra_pages(base_url, homepage_html):
         "/policies/terms-of-service",
     ]
     pages += discover_contact_links(homepage_html, base_url)
-    pages = list(dict.fromkeys(pages))[:18]
+    pages = list(dict.fromkeys(pages))[:10]
 
     combined = homepage_html or ""
+    if any(v for v in collect_emails(combined).values()):
+        return combined   # homepage par hi trusted email mil gayi
+
     for path in pages:
+        if deadline is not None and time.time() > deadline:
+            break
         try:
             page_html, _ = fetch_page(base_url.rstrip("/") + path)
             if page_html:
                 combined += "\n" + page_html
+                if any(v for v in collect_emails(page_html).values()):
+                    break   # trusted email mil gayi — baqi pages fetch karne ki zaroorat nahi
         except Exception:
             pass
     return combined
@@ -1063,7 +1079,7 @@ def score_quality(score):
 #   ok / no_email / not_shopify / password / name_mismatch / no_products / error
 # ============================================================
 
-def analyze_store(domain, store_name, source_app):
+def analyze_store(domain, store_name, source_app, deadline=None):
     try:
         html, final_url = fetch_page(normalize_url(domain))
         if not html or not detect_shopify(html):
@@ -1079,13 +1095,19 @@ def analyze_store(domain, store_name, source_app):
         if STRICT_NAME_MATCH and not name_matches_page(store_name, final_domain, html):
             return "name_mismatch", None
 
+        if deadline is not None and time.time() > deadline:
+            return "timeout", None
+
         base_url = normalize_url(final_url)
 
         product_count = get_product_count(base_url)
         if product_count < MIN_PRODUCTS:
             return "no_products", None
 
-        combined_text = fetch_extra_pages(base_url, html)
+        if deadline is not None and time.time() > deadline:
+            return "timeout", None
+
+        combined_text = fetch_extra_pages(base_url, html, deadline)
 
         ranked = rank_emails(collect_emails(combined_text), final_domain, store_name)
         email = next((e for e in ranked if domain_has_mx(e.split("@")[1])), "")
@@ -1136,13 +1158,18 @@ def analyze_store(domain, store_name, source_app):
 
 def process_store_name(name, handle, guesses, deadline):
     """Ek store name ke saare domain guesses sequentially try karta hai aur pehli asli hit
-    (ok ya no_email) par ruk jata hai. Time budget khatam ho to 'timeout' (name seen nahi banta,
-    agli run me dobara try hota hai).  Returns (status, data, reasons_counter)."""
+    (ok ya no_email) par ruk jata hai. Har guess ko STORE_TIME_BUDGET_SECONDS se zyada waqt
+    nahi milta — pehle ye bandish nahi thi, is liye ek slow/heavy store worker ko kai minute
+    tak roke rakh sakta tha, jab tak baaqi saare 25 workers bhi similar slow stores par
+    na ja atken aur log kaafi der ke liye chup ho jaye. Global time budget khatam ho to
+    'timeout' (name seen nahi banta, agli run me dobara try hota hai).
+    Returns (status, data, reasons_counter)."""
     reasons = Counter()
     for domain in guesses:
         if time.time() > deadline:
             return "timeout", None, reasons
-        status, data = analyze_store(domain, name, handle)
+        guess_deadline = min(deadline, time.time() + STORE_TIME_BUDGET_SECONDS)
+        status, data = analyze_store(domain, name, handle, guess_deadline)
         if status in ("ok", "no_email"):
             return status, data, reasons
         reasons[status] += 1
@@ -1433,6 +1460,21 @@ def run_once():
         save_seen(seen)
 
     if todo:
+        progress = {"done": 0, "total": len(todo)}
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat():
+            # Sirf visibility ke liye — koi logic yahan nahi. Ab se log kabhi
+            # HEARTBEAT_SECONDS se zyada der chup nahi rahega, chahe koi store
+            # slow ho ya sab workers busy hon — pehle iski koi khabar nahi milti thi.
+            while not stop_heartbeat.wait(HEARTBEAT_SECONDS):
+                logger.info(
+                    "... jaari hai: %s/%s store names complete (kaam chal raha hai, atka nahi)",
+                    progress["done"], progress["total"]
+                )
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
+
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         try:
             futures = {
@@ -1453,6 +1495,7 @@ def run_once():
                     continue                      # seen nahi banega -> agli run me dobara
 
                 completed += 1
+                progress["done"] = completed
                 completed_names.add(name)
                 reason_stats.update(reasons)
 
@@ -1493,6 +1536,7 @@ def run_once():
             logger.warning("Interrupted — ab tak ka data save kar raha hun...")
             executor.shutdown(wait=False, cancel_futures=True)
         finally:
+            stop_heartbeat.set()
             executor.shutdown(wait=False)
             leads.sort(key=lambda x: x.get("Lead Score", 0), reverse=True)
             flush()
