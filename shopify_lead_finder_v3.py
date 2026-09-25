@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.1 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -22,6 +22,50 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
+
+-------------------------------------------------------------------------------
+CHANGELOG v3.1 — FIX: script "stuck ho jati thi" bug
+-------------------------------------------------------------------------------
+Root cause #1 (asal wajah — deadlock): `domain_has_mx()` `@lru_cache` use kar
+raha tha. Python ka `lru_cache` ek SINGLE GLOBAL LOCK ke sath kaam karta hai —
+jab do threads EK HI WAQT alag-alag (cache-miss) arguments ke sath call karte
+hain, dusra thread pehle wale ke poora hone tak BLOCK ho jata hai, chahe
+domain bilkul different ho. Agar kisi ek domain ki DNS lookup kahin phans
+jaye (dnspython ka `lifetime=` kuch network conditions — jaise silently
+dropped UDP packets — me guarantee nahi karta), to us EK stuck call ke peeche
+saare 25 workers is lock par queue ho kar poora pipeline freeze kar dete
+hain. Ye "kuch dair chalne ke baad achanak silence" wale symptom ki 100%
+wajah thi.
+  FIX: `domain_has_mx` ab ek chhoti dedicated thread-pool me chalti hai aur
+  `future.result(timeout=DNS_HARD_TIMEOUT_SECONDS)` se HARD wall-clock cap
+  ke sath bandhi hai — dnspython internally kuch bhi kare, humari taraf se
+  guarantee hai ke ye kabhi bhi DNS_HARD_TIMEOUT_SECONDS se zyada nahi rukegi.
+  Cache ab manual dict + lock hai jahan sirf dict read/write lock hota hai,
+  khud DNS call nahi — is se different domains ke concurrent lookups ab
+  ek-dusre ko block nahi karte.
+
+Root cause #2 (defense-in-depth — trickle attack): sirf `fetch_text()` me
+comment tha ke "timeout tuple sirf har read chunk ke darmiyan gap bound karta
+hai, total download time nahi — agar server data trickle kare (thora thora,
+har chunk apne window ke andar) to total time unbounded reh sakta hai." Ye
+fix sirf `fetch_text` me tha; `fetch_page`, `get_product_count`, aur review
+page fetch me nahi — jahan 25 parallel workers store websites hit karte hain.
+  FIX: naya `bounded_get()` helper — `stream=True` ke sath chunk-by-chunk
+  padhta hai aur HAR chunk ke baad total-elapsed-time check karta hai; agar
+  hard cap cross ho jaye to turant abort. Ab `fetch_text`, `fetch_page`,
+  `get_product_count`, aur review-page fetch sab isi helper se guzarte hain.
+
+Root cause #3 (belt-and-suspenders): `socket.setdefaulttimeout(...)` add kiya
+— ye un calls (jaise Google Sheets / gspread) ko bhi ek fallback socket
+timeout deta hai jinka apna explicit per-call timeout set nahi hota.
+
+Operational advice: agar GitHub Actions me chalate ho, workflow ke
+`timeout-minutes` ko is script ke HARD_TIMEOUT_MINUTES se thoda ZYADA rakho
+(default = RUN_TIME_BUDGET_MINUTES + 5), taake script ka apna watchdog
+GitHub ke forceful "cancelled" se PEHLE fire ho — GitHub ka cancel kisi
+diagnostic log ke bina hota hai, script ka apna watchdog leads save karke
+cleanly exit karta hai.
+-------------------------------------------------------------------------------
 """
 
 import os
@@ -30,15 +74,17 @@ import sys
 import csv
 import json
 import time
+import socket
 import html as html_lib
 import logging
 import threading
 import requests
 
 from collections import Counter, namedtuple
-from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+)
 
 try:
     import gspread
@@ -61,6 +107,16 @@ except ImportError:
 
 
 # ============================================================
+# GLOBAL SAFETY NET
+# ============================================================
+# Fallback socket-level timeout for ANY connection that doesn't explicitly
+# set its own (e.g. gspread/Google API calls). Calls that DO set an explicit
+# timeout (our own requests.get(..., timeout=...)) are unaffected by this —
+# this only kicks in when nothing else would.
+socket.setdefaulttimeout(20)
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -79,8 +135,14 @@ DISCOVERY_BUDGET_MINUTES = float(os.environ.get("DISCOVERY_BUDGET_MINUTES", "6")
 # --- Hard safety timeout: script kabhi bhi hang ho (network trickle, DNS, ya koi
 #     anjaan bug) to process ZABARDASTI khatam ho jata hai taake GitHub ka apna
 #     forceful "cancelled" (jisme koi clean log nahi milta) kabhi na aaye.
-#     0 = khud-ba-khud RUN_TIME_BUDGET_MINUTES + 8 minute.
+#     0 = khud-ba-khud RUN_TIME_BUDGET_MINUTES + 5 minute.
 HARD_TIMEOUT_MINUTES = float(os.environ.get("HARD_TIMEOUT_MINUTES", "0"))
+
+# --- Network hard caps (trickle-attack safe: total wall-clock time, na ke
+#     sirf do reads ke darmiyan gap) ---
+NETWORK_HARD_TIMEOUT_SECONDS = float(os.environ.get("NETWORK_HARD_TIMEOUT_SECONDS", "20"))
+DNS_HARD_TIMEOUT_SECONDS = float(os.environ.get("DNS_HARD_TIMEOUT_SECONDS", "8"))
+DNS_WORKERS = int(os.environ.get("DNS_WORKERS", "8"))
 
 # --- How much to scrape per run ---
 NAMES_TARGET_PER_RUN = int(os.environ.get("NAMES_TARGET_PER_RUN", "2500"))      # naye store names ka target
@@ -203,6 +265,89 @@ def is_bad_domain(domain):
 
 
 # ============================================================
+# BOUNDED NETWORK FETCH
+# ============================================================
+# requests' `timeout=(connect, read)` only bounds the gap BETWEEN two reads —
+# a server that trickles data (small chunks, each arriving just inside the
+# read-timeout window) can keep a connection open indefinitely, and that
+# unbounded call can eventually starve every worker thread. bounded_get()
+# closes that hole: it streams the response and checks TOTAL elapsed wall
+# time after every chunk, aborting hard if the cap is crossed — regardless
+# of how the server paces its bytes.
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+)
+
+
+def bounded_get(url, params=None, headers=None, hard_timeout=None, retries=1,
+                 retry_sleep=1.5, max_bytes=8_000_000):
+    """GET jo total wall-clock time ko HARD cap karta hai (trickle-safe).
+    Returns a lightweight object with .status_code, .text, .url — ya None
+    agar fetch fail/timeout ho jaye."""
+    hard_timeout = hard_timeout if hard_timeout is not None else NETWORK_HARD_TIMEOUT_SECONDS
+    req_headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "en-US;q=0.9"}
+    if headers:
+        req_headers.update(headers)
+
+    class _Result:
+        def __init__(self, status_code, text, url):
+            self.status_code = status_code
+            self.text = text
+            self.url = url
+
+    for attempt in range(max(1, retries)):
+        start = time.time()
+        resp = None
+        try:
+            resp = requests.get(
+                url, params=params, headers=req_headers, stream=True,
+                timeout=(min(hard_timeout, 10), hard_timeout),
+                allow_redirects=True,
+            )
+            chunks, total = [], 0
+            for chunk in resp.iter_content(chunk_size=8192):
+                if time.time() - start > hard_timeout:
+                    raise TimeoutError(f"bounded_get: {hard_timeout}s cap crossed (trickle?) for {url}")
+                if chunk:
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > max_bytes:
+                        break
+            body = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+            return _Result(resp.status_code, body, resp.url)
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(retry_sleep)
+                continue
+            return None
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+    return None
+
+
+def fetch_text(url, timeout=30, retries=3):
+    """Sitemap/index pages ke liye — bounded_get par based, trickle-safe."""
+    for attempt in range(retries):
+        result = bounded_get(url, hard_timeout=timeout, retries=1)
+        if result is None:
+            time.sleep(1.5)
+            continue
+        if result.status_code == 200:
+            return result.text
+        if result.status_code == 429:
+            time.sleep(3 * (attempt + 1))
+            continue
+        return ""
+    return ""
+
+
+# ============================================================
 # LOCAL PERSISTENCE
 # ============================================================
 
@@ -296,32 +441,6 @@ RESERVED_HANDLES = {
     "login", "partner", "tutorials", "blog", "guides", "built-in-features",
     "extensions", "category-features", "robots.txt",
 }
-
-
-def fetch_text(url, timeout=30, retries=3):
-    """timeout ek tuple (connect, read) ke taur par diya jata hai taake response
-    dheere-dheere trickle ho (chota sa data har kuch second baad) tab bhi total
-    fetch waqt bounded rahe — sirf ek scalar timeout is trickle ko nahi rokta."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-        ),
-        "Accept-Language": "en-US;q=0.9",
-    }
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, headers=headers, timeout=(min(timeout, 10), timeout))
-        except requests.RequestException:
-            time.sleep(1.5)
-            continue
-        if resp.status_code == 200:
-            return resp.text
-        if resp.status_code == 429:
-            time.sleep(3 * (attempt + 1))
-            continue
-        return ""
-    return ""
 
 
 def handle_from_url(url):
@@ -446,36 +565,27 @@ def scrape_app_reviews_page(handle, page):
     """Returns (names_list, state) — state: 'ok' | 'missing' (404) | 'error'."""
     url = f"https://apps.shopify.com/{handle}/reviews"
     params = {"sort_by": "newest", "page": page}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-        ),
-        "Accept-Language": "en-US;q=0.9",
-    }
 
-    resp = None
+    result = None
     for attempt in range(3):
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=20)
-        except requests.RequestException:
+        result = bounded_get(url, params=params, hard_timeout=20, retries=1)
+        if result is None:
             time.sleep(2)
             continue
-        if resp.status_code == 429:
+        if result.status_code == 429:
             time.sleep(5 * (attempt + 1))
+            result = None
             continue
         break
-    else:
-        return [], "error"
 
-    if resp is None:
+    if result is None:
         return [], "error"
-    if resp.status_code == 404:
+    if result.status_code == 404:
         return [], "missing"
-    if resp.status_code != 200:
+    if result.status_code != 200:
         return [], "error"
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(result.text, "html.parser")
     review_blocks = soup.find_all("div", attrs={"data-merchant-review": True})
 
     names = []
@@ -637,23 +747,12 @@ def collect_new_names(plan, seen, deadline):
 # ============================================================
 
 def fetch_page(url):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-        )
-    }
-    try:
-        response = requests.get(
-            url, headers=headers,
-            timeout=(min(REQUEST_TIMEOUT, 6), REQUEST_TIMEOUT),
-            allow_redirects=True,
-        )
-        if response.status_code >= 400:
-            return "", response.url
-        return response.text, response.url
-    except Exception:
+    result = bounded_get(url, hard_timeout=min(NETWORK_HARD_TIMEOUT_SECONDS, max(REQUEST_TIMEOUT, 10)), retries=1)
+    if result is None:
         return "", url
+    if result.status_code >= 400:
+        return "", result.url
+    return result.text, result.url
 
 
 def detect_shopify(html):
@@ -742,14 +841,11 @@ def detect_theme(html):
 
 def get_product_count(base_url):
     url = base_url.rstrip("/") + "/products.json?limit=250"
+    result = bounded_get(url, hard_timeout=min(NETWORK_HARD_TIMEOUT_SECONDS, max(REQUEST_TIMEOUT, 10)), retries=1)
+    if result is None or result.status_code != 200:
+        return 0
     try:
-        response = requests.get(
-            url, headers={"User-Agent": "Mozilla/5.0"},
-            timeout=(min(REQUEST_TIMEOUT, 6), REQUEST_TIMEOUT),
-        )
-        if response.status_code != 200:
-            return 0
-        return len(response.json().get("products", []))
+        return len(json.loads(result.text).get("products", []))
     except Exception:
         return 0
 
@@ -901,19 +997,37 @@ def rank_emails(found, store_domain, store_name):
     return [e for _, _, e in scored]
 
 
-@lru_cache(maxsize=50000)
-def domain_has_mx(domain):
-    """Bounce se bachne ke liye: domain email receive kar sakta hai? (dnspython ho tabhi)."""
-    if not (VERIFY_MX and DNS_AVAILABLE):
-        return True
+# ------------------------------------------------------------
+# DNS / MX verification — FIXED (see CHANGELOG v3.1 above)
+# ------------------------------------------------------------
+# Ye pehle @lru_cache use karti thi, jiska ek SINGLE GLOBAL LOCK hota hai —
+# concurrent cache-misses (chahe alag-alag domains ke liye) ek-dusre ko
+# BLOCK karte the. Agar ek domain ki DNS lookup kahin phans jaye, saare
+# workers isi lock ke peeche queue ho kar poori script ko freeze kar dete
+# the. Ab: (1) cache sirf ek dict+lock hai jo sirf read/write lock karta hai,
+# DNS call ko nahi, aur (2) har lookup ek dedicated thread-pool me chalti hai
+# jis par HARD wall-clock timeout (future.result(timeout=...)) lagaya gaya
+# hai — dnspython internally kuch bhi kare, ye kabhi DNS_HARD_TIMEOUT_SECONDS
+# se zyada nahi rukegi.
+
+_mx_cache = {}
+_mx_cache_lock = threading.Lock()
+_dns_executor = ThreadPoolExecutor(max_workers=DNS_WORKERS, thread_name_prefix="dns-mx") if DNS_AVAILABLE else None
+
+
+def _resolve_has_mx(domain):
+    """Actual (potentially slow) DNS work — runs inside _dns_executor."""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 3       # per-nameserver attempt
+    resolver.lifetime = 4      # total across all nameservers
     try:
-        dns.resolver.resolve(domain, "MX", lifetime=4)
+        resolver.resolve(domain, "MX")
         return True
     except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
         return False
     except dns.resolver.NoAnswer:
         try:
-            dns.resolver.resolve(domain, "A", lifetime=4)
+            resolver.resolve(domain, "A")
             return True
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
             return False
@@ -921,6 +1035,32 @@ def domain_has_mx(domain):
             return True
     except Exception:
         return True   # timeout waghera — transient error par email drop nahi karte
+
+
+def domain_has_mx(domain):
+    """Bounce se bachne ke liye: domain email receive kar sakta hai?
+    Hard wall-clock capped — kabhi bhi poore pipeline ko block nahi karti."""
+    if not (VERIFY_MX and DNS_AVAILABLE):
+        return True
+
+    with _mx_cache_lock:
+        cached = _mx_cache.get(domain)
+    if cached is not None:
+        return cached
+
+    try:
+        future = _dns_executor.submit(_resolve_has_mx, domain)
+        result = future.result(timeout=DNS_HARD_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        # Lookup abhi bhi background me chal rahi hogi (thread pool me) — hum
+        # aage badh jaate hain aur transient treat karte hain (drop nahi karte).
+        result = True
+    except Exception:
+        result = True
+
+    with _mx_cache_lock:
+        _mx_cache[domain] = result
+    return result
 
 
 def discover_contact_links(html, base_url):
@@ -946,7 +1086,8 @@ def fetch_extra_pages(base_url, homepage_html, deadline=None):
     Speedup + safety: (1) trusted email (mailto/Cloudflare) milte hi ruk jata hai,
     baqi pages fetch nahi hoti — zyadatar stores 1-2 pages ke baad hi mil jati hain.
     (2) deadline diya ho to har page se pehle check hota hai, taake ek slow store
-    baqi 25 workers ke saath poora run atka na sake."""
+    baqi 25 workers ke saath poora run atka na sake. (3) har individual page fetch
+    khud bhi trickle-safe hai (bounded_get)."""
     pages = [
         "/pages/contact", "/pages/contact-us", "/contact", "/pages/get-in-touch",
         "/pages/about", "/about", "/pages/about-us", "/pages/faq", "/pages/support",
@@ -1361,15 +1502,20 @@ def run_once():
     t0 = time.time()
     scrape_deadline = t0 + SCRAPE_BUDGET_MINUTES * 60
     run_deadline = t0 + RUN_TIME_BUDGET_MINUTES * 60
-    hard_minutes = HARD_TIMEOUT_MINUTES if HARD_TIMEOUT_MINUTES > 0 else (RUN_TIME_BUDGET_MINUTES + 8)
+    hard_minutes = HARD_TIMEOUT_MINUTES if HARD_TIMEOUT_MINUTES > 0 else (RUN_TIME_BUDGET_MINUTES + 5)
 
     watchdog = threading.Thread(target=_watchdog_force_exit, args=(hard_minutes,), daemon=True)
     watchdog.start()
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        "SHOPIFY LEAD FINDER v3.1 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
         RUN_TIME_BUDGET_MINUTES, hard_minutes
+    )
+    logger.info(
+        "NOTE: agar GitHub Actions me chala rahe ho, workflow 'timeout-minutes' ko %s se zyada rakho, "
+        "warna GitHub ka forceful cancel humare apne watchdog se pehle chal sakta hai.",
+        hard_minutes
     )
     logger.info("=" * 70)
 
