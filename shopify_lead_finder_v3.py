@@ -32,6 +32,7 @@ import json
 import time
 import html as html_lib
 import logging
+import threading
 import requests
 
 from collections import Counter, namedtuple
@@ -71,6 +72,15 @@ def _env_bool(name, default):
 SITEMAP_INDEX_URL = os.environ.get("APPS_SITEMAP_INDEX", "https://apps.shopify.com/sitemap").strip()
 APPS_SITEMAP_LANG = os.environ.get("APPS_SITEMAP_LANG", "en").strip()
 CATEGORY_FALLBACK_PAGES = int(os.environ.get("CATEGORY_FALLBACK_PAGES", "4"))   # sitemap fail ho to
+MAX_SITEMAP_FILES = int(os.environ.get("MAX_SITEMAP_FILES", "6"))               # ek run me kitni sitemap files fetch karein
+DISCOVERY_WORKERS = int(os.environ.get("DISCOVERY_WORKERS", "4"))
+DISCOVERY_BUDGET_MINUTES = float(os.environ.get("DISCOVERY_BUDGET_MINUTES", "6"))  # app-list dhoondne ka max waqt
+
+# --- Hard safety timeout: script kabhi bhi hang ho (network trickle, DNS, ya koi
+#     anjaan bug) to process ZABARDASTI khatam ho jata hai taake GitHub ka apna
+#     forceful "cancelled" (jisme koi clean log nahi milta) kabhi na aaye.
+#     0 = khud-ba-khud RUN_TIME_BUDGET_MINUTES + 8 minute.
+HARD_TIMEOUT_MINUTES = float(os.environ.get("HARD_TIMEOUT_MINUTES", "0"))
 
 # --- How much to scrape per run ---
 NAMES_TARGET_PER_RUN = int(os.environ.get("NAMES_TARGET_PER_RUN", "2500"))      # naye store names ka target
@@ -91,9 +101,8 @@ RUN_EVERY_MINUTES = float(os.environ.get("RUN_EVERY_MINUTES", "60"))
 
 # --- Analysis ---
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "8"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "100"))
-EXTRA_PAGES_LIMIT = int(os.environ.get("EXTRA_PAGES_LIMIT", "10"))    # ek candidate par max extra pages
 
 # --- Quality filters ---
 MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))
@@ -288,6 +297,9 @@ RESERVED_HANDLES = {
 
 
 def fetch_text(url, timeout=30, retries=3):
+    """timeout ek tuple (connect, read) ke taur par diya jata hai taake response
+    dheere-dheere trickle ho (chota sa data har kuch second baad) tab bhi total
+    fetch waqt bounded rahe — sirf ek scalar timeout is trickle ko nahi rokta."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -297,14 +309,14 @@ def fetch_text(url, timeout=30, retries=3):
     }
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = requests.get(url, headers=headers, timeout=(min(timeout, 10), timeout))
         except requests.RequestException:
-            time.sleep(2)
+            time.sleep(1.5)
             continue
         if resp.status_code == 200:
             return resp.text
         if resp.status_code == 429:
-            time.sleep(5 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
             continue
         return ""
     return ""
@@ -317,31 +329,52 @@ def handle_from_url(url):
     return path
 
 
-def discover_apps_via_categories():
-    """Fallback: sitemap na chale to category pages se app handles nikalta hai."""
-    logger.warning("Sitemap se apps nahi mili — category pages se try kar raha hun (fallback).")
-    home = fetch_text("https://apps.shopify.com/")
+def discover_apps_via_categories(deadline):
+    """Fallback: sitemap na chale to category pages se app handles nikalta hai.
+    Deadline se bandha hua hai — pehle ye function unbounded tha aur (agar sitemap
+    fail ho aur Shopify GitHub Actions ke IPs ko slow/block kare) ghanton tak
+    sequentially fetch karta reh sakta tha. Ab parallel + deadline-checked hai."""
+    logger.warning("Sitemap se apps nahi mili — category pages se try kar raha hun (fallback, bounded).")
+    home = fetch_text("https://apps.shopify.com/", timeout=20)
     slugs = list(dict.fromkeys(re.findall(r"/categories/([a-z0-9-]+)", home)))[:40]
     apps = {}
-    for slug in slugs:
+
+    def fetch_slug_page(slug, page):
+        if time.time() > deadline:
+            return slug, page, []
+        page_html = fetch_text(f"https://apps.shopify.com/categories/{slug}/all?page={page}", timeout=20)
+        found = re.findall(
+            r'href="(?:https://apps\.shopify\.com)?/([a-z0-9][a-z0-9_-]*)\?[^"]*surface_type=category',
+            page_html,
+        )
+        return slug, page, found
+
+    with ThreadPoolExecutor(max_workers=DISCOVERY_WORKERS) as executor:
         for page in range(1, CATEGORY_FALLBACK_PAGES + 1):
-            page_html = fetch_text(f"https://apps.shopify.com/categories/{slug}/all?page={page}")
-            found = re.findall(
-                r'href="(?:https://apps\.shopify\.com)?/([a-z0-9][a-z0-9_-]*)\?[^"]*surface_type=category',
-                page_html,
-            )
-            if not found:
+            if time.time() > deadline or not slugs:
                 break
-            for h in found:
-                if h not in RESERVED_HANDLES:
-                    apps.setdefault(h, "")
-            time.sleep(APP_STORE_DELAY_SECONDS)
+            futures = [executor.submit(fetch_slug_page, slug, page) for slug in slugs]
+            still_active = []
+            for future in as_completed(futures):
+                slug, _, found = future.result()
+                if found:
+                    still_active.append(slug)
+                    for h in found:
+                        if h not in RESERVED_HANDLES:
+                            apps.setdefault(h, "")
+            slugs = still_active   # jo slug is page par khali aaya, agli page skip
+
+    logger.info("Category fallback se apps mile: %s", len(apps))
     return apps
 
 
 def discover_app_handles():
-    """Returns [(handle, lastmod)] — recently updated (active) apps pehle."""
-    index_xml = fetch_text(SITEMAP_INDEX_URL)
+    """Returns [(handle, lastmod)] — recently updated (active) apps pehle.
+    Poori discovery DISCOVERY_BUDGET_MINUTES tak bandhi hai — kabhi bhi is se
+    zyada waqt scraping shuru hue bina nahi guzarta."""
+    deadline = time.time() + DISCOVERY_BUDGET_MINUTES * 60
+
+    index_xml = fetch_text(SITEMAP_INDEX_URL, timeout=20)
     sitemap_urls = re.findall(
         r"<loc>\s*([^<\s]*sitemap_apps_%s\.xml[^<\s]*)\s*</loc>" % re.escape(APPS_SITEMAP_LANG),
         index_xml,
@@ -349,21 +382,53 @@ def discover_app_handles():
     if not sitemap_urls:
         sitemap_urls = [f"https://apps.shopify.com/sitemap_apps_{APPS_SITEMAP_LANG}.xml"]
 
+    if len(sitemap_urls) > MAX_SITEMAP_FILES:
+        logger.warning(
+            "%s sitemap files mile, sirf pehli %s is run me (MAX_SITEMAP_FILES) — baaqi agli run me.",
+            len(sitemap_urls), MAX_SITEMAP_FILES
+        )
+        sitemap_urls = sitemap_urls[:MAX_SITEMAP_FILES]
+
+    logger.info("Sitemap files fetch honi hain: %s", len(sitemap_urls))
     apps = {}
-    for sm_url in sitemap_urls:
-        xml = fetch_text(sm_url, timeout=90)
-        for m in re.finditer(
-            r"<url>\s*<loc>\s*([^<\s]+)\s*</loc>(?:\s*<lastmod>\s*([^<\s]*)\s*</lastmod>)?", xml
-        ):
-            handle = handle_from_url(m.group(1))
-            if handle:
-                apps.setdefault(handle, m.group(2) or "")
+
+    def fetch_one(sm_url):
+        if time.time() > deadline:
+            return sm_url, ""
+        return sm_url, fetch_text(sm_url, timeout=25, retries=2)
+
+    with ThreadPoolExecutor(max_workers=min(DISCOVERY_WORKERS, max(1, len(sitemap_urls)))) as executor:
+        futures = [executor.submit(fetch_one, u) for u in sitemap_urls]
+        done = 0
+        for future in as_completed(futures):
+            sm_url, xml = future.result()
+            done += 1
+            count_before = len(apps)
+            for m in re.finditer(
+                r"<url>\s*<loc>\s*([^<\s]+)\s*</loc>(?:\s*<lastmod>\s*([^<\s]*)\s*</lastmod>)?", xml
+            ):
+                handle = handle_from_url(m.group(1))
+                if handle:
+                    apps.setdefault(handle, m.group(2) or "")
+            logger.info(
+                "Sitemap %s/%s fetch hui (%s): +%s apps (total %s)",
+                done, len(sitemap_urls), sm_url, len(apps) - count_before, len(apps)
+            )
+
+    if not apps and time.time() < deadline:
+        apps = discover_apps_via_categories(deadline)
 
     if not apps:
-        apps = discover_apps_via_categories()
+        logger.error(
+            "Koi bhi app discover nahi ho saki is run me (sitemap + category fallback dono khali/blocked). "
+            "Ho sakta hai apps.shopify.com is IP range ko throttle/block kar raha ho — agli run me dobara try hoga."
+        )
 
     ordered = sorted(apps.items(), key=lambda kv: kv[1], reverse=True)
-    logger.info("Apps discovered from Shopify App Store: %s", len(ordered))
+    logger.info(
+        "Apps discovered from Shopify App Store: %s (discovery %.1f min lagi)",
+        len(ordered), (time.time() - (deadline - DISCOVERY_BUDGET_MINUTES * 60)) / 60
+    )
     return ordered
 
 
@@ -577,7 +642,11 @@ def fetch_page(url):
         )
     }
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = requests.get(
+            url, headers=headers,
+            timeout=(min(REQUEST_TIMEOUT, 6), REQUEST_TIMEOUT),
+            allow_redirects=True,
+        )
         if response.status_code >= 400:
             return "", response.url
         return response.text, response.url
@@ -867,10 +936,8 @@ def discover_contact_links(html, base_url):
     return list(dict.fromkeys(links))[:4]
 
 
-def fetch_extra_pages(base_url, homepage_html, deadline=None):
-    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se.
-    'deadline' diya ho to us waqt ke baad naye pages fetch karna band kar deta hai —
-    isi se ek slow/dead domain poora RUN_TIME_BUDGET nigal nahi sakta."""
+def fetch_extra_pages(base_url, homepage_html):
+    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se."""
     pages = [
         "/pages/contact", "/pages/contact-us", "/contact", "/pages/get-in-touch",
         "/pages/about", "/about", "/pages/about-us", "/pages/faq", "/pages/support",
@@ -879,12 +946,10 @@ def fetch_extra_pages(base_url, homepage_html, deadline=None):
         "/policies/terms-of-service",
     ]
     pages += discover_contact_links(homepage_html, base_url)
-    pages = list(dict.fromkeys(pages))[:EXTRA_PAGES_LIMIT]
+    pages = list(dict.fromkeys(pages))[:18]
 
     combined = homepage_html or ""
     for path in pages:
-        if deadline is not None and time.time() > deadline:
-            break
         try:
             page_html, _ = fetch_page(base_url.rstrip("/") + path)
             if page_html:
@@ -998,18 +1063,9 @@ def score_quality(score):
 #   ok / no_email / not_shopify / password / name_mismatch / no_products / error
 # ============================================================
 
-def analyze_store(domain, store_name, source_app, deadline=None):
-    """'deadline' diya ho aur beech me time khatam ho jaye to 'timeout' return hota hai —
-    is candidate ko is run me chhod diya jata hai (agli run me dobara try hoga), taake
-    ek slow/hanging domain poora executor ko run_deadline se aage na ghaseet le jaye."""
-
-    def past_deadline():
-        return deadline is not None and time.time() > deadline
-
+def analyze_store(domain, store_name, source_app):
     try:
         html, final_url = fetch_page(normalize_url(domain))
-        if past_deadline():
-            return "timeout", None
         if not html or not detect_shopify(html):
             return "not_shopify", None
 
@@ -1026,14 +1082,10 @@ def analyze_store(domain, store_name, source_app, deadline=None):
         base_url = normalize_url(final_url)
 
         product_count = get_product_count(base_url)
-        if past_deadline():
-            return "timeout", None
         if product_count < MIN_PRODUCTS:
             return "no_products", None
 
-        combined_text = fetch_extra_pages(base_url, html, deadline)
-        if past_deadline():
-            return "timeout", None
+        combined_text = fetch_extra_pages(base_url, html)
 
         ranked = rank_emails(collect_emails(combined_text), final_domain, store_name)
         email = next((e for e in ranked if domain_has_mx(e.split("@")[1])), "")
@@ -1090,11 +1142,9 @@ def process_store_name(name, handle, guesses, deadline):
     for domain in guesses:
         if time.time() > deadline:
             return "timeout", None, reasons
-        status, data = analyze_store(domain, name, handle, deadline)
+        status, data = analyze_store(domain, name, handle)
         if status in ("ok", "no_email"):
             return status, data, reasons
-        if status == "timeout":
-            return "timeout", None, reasons
         reasons[status] += 1
     return "not_found", None, reasons
 
@@ -1262,14 +1312,38 @@ def save_apps_state(apps_ws, state, updates):
 # ONE RUN
 # ============================================================
 
+def _watchdog_force_exit(minutes):
+    """Aakhri safety net: agar koi cheez (unknown bug, network trickle, DNS hang)
+    is process ko itni der rok le, to process khud khatam ho jata hai — GitHub
+    ke forceful 'cancelled' (jisme koi diagnostic log nahi milta) ka intezar
+    nahi karta. Data loss minimal hota hai kyunke leads har CHECKPOINT_INTERVAL
+    par pehle hi sheet me save ho chuki hoti hain."""
+    time.sleep(minutes * 60)
+    logger.error(
+        "HARD TIMEOUT (%.0f min) — process kahin atka hua tha, isliye zabardasti "
+        "exit kar raha hun. Ab tak jo leads mil chuki thin wo already save hain. "
+        "Agli run automatically aage se shuru hogi.",
+        minutes
+    )
+    logging.shutdown()
+    os._exit(1)
+
+
 def run_once():
     """Returns 0 on success, 1 on setup failure."""
     t0 = time.time()
     scrape_deadline = t0 + SCRAPE_BUDGET_MINUTES * 60
     run_deadline = t0 + RUN_TIME_BUDGET_MINUTES * 60
+    hard_minutes = HARD_TIMEOUT_MINUTES if HARD_TIMEOUT_MINUTES > 0 else (RUN_TIME_BUDGET_MINUTES + 8)
+
+    watchdog = threading.Thread(target=_watchdog_force_exit, args=(hard_minutes,), daemon=True)
+    watchdog.start()
 
     logger.info("=" * 70)
-    logger.info("SHOPIFY LEAD FINDER v3 — dynamic apps | email mandatory | budget %s min", RUN_TIME_BUDGET_MINUTES)
+    logger.info(
+        "SHOPIFY LEAD FINDER v3 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        RUN_TIME_BUDGET_MINUTES, hard_minutes
+    )
     logger.info("=" * 70)
 
     ensure_data_dir()
@@ -1366,20 +1440,7 @@ def run_once():
                 for name, handle, guesses in todo
             }
 
-            # Hard safety-net: as_completed() ko khud ek overall timeout diya hai.
-            # Individual candidates ab run_deadline khud check karte hain (upar
-            # analyze_store / process_store_name me), lekin agar phir bhi kuch
-            # atka reh jaye, ye guarantee karta hai ke poora analysis phase kabhi
-            # run_deadline se zyada wall-clock time nahi lega — GitHub Actions ke
-            # apne timeout-minutes se pehle hi Python khud gracefully ruk jayega
-            # aur jo mil chuka hai wo flush() kar dega.
-            remaining = max(1, run_deadline - time.time())
-            try:
-                completed_iter = as_completed(futures, timeout=remaining)
-            except TimeoutError:
-                completed_iter = iter(())
-
-            for future in completed_iter:
+            for future in as_completed(futures):
                 name = futures[future]
 
                 try:
@@ -1427,12 +1488,6 @@ def run_once():
                 if completed % CHECKPOINT_INTERVAL == 0:
                     flush()
                     logger.info("Checkpoint saved at %s/%s.", completed, len(todo))
-
-            if time.time() > run_deadline:
-                logger.warning(
-                    "Run time budget khatam — baaki candidates process nahi hue, "
-                    "unke naam agli run me dobara try honge."
-                )
 
         except KeyboardInterrupt:
             logger.warning("Interrupted — ab tak ka data save kar raha hun...")
