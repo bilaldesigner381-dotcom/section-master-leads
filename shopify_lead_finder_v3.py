@@ -91,8 +91,9 @@ RUN_EVERY_MINUTES = float(os.environ.get("RUN_EVERY_MINUTES", "60"))
 
 # --- Analysis ---
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "8"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "100"))
+EXTRA_PAGES_LIMIT = int(os.environ.get("EXTRA_PAGES_LIMIT", "10"))    # ek candidate par max extra pages
 
 # --- Quality filters ---
 MIN_PRODUCTS = int(os.environ.get("MIN_PRODUCTS", "1"))
@@ -866,8 +867,10 @@ def discover_contact_links(html, base_url):
     return list(dict.fromkeys(links))[:4]
 
 
-def fetch_extra_pages(base_url, homepage_html):
-    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se."""
+def fetch_extra_pages(base_url, homepage_html, deadline=None):
+    """Contact/about/policy pages ek baar fetch — email + feature detection dono isi se.
+    'deadline' diya ho to us waqt ke baad naye pages fetch karna band kar deta hai —
+    isi se ek slow/dead domain poora RUN_TIME_BUDGET nigal nahi sakta."""
     pages = [
         "/pages/contact", "/pages/contact-us", "/contact", "/pages/get-in-touch",
         "/pages/about", "/about", "/pages/about-us", "/pages/faq", "/pages/support",
@@ -876,10 +879,12 @@ def fetch_extra_pages(base_url, homepage_html):
         "/policies/terms-of-service",
     ]
     pages += discover_contact_links(homepage_html, base_url)
-    pages = list(dict.fromkeys(pages))[:18]
+    pages = list(dict.fromkeys(pages))[:EXTRA_PAGES_LIMIT]
 
     combined = homepage_html or ""
     for path in pages:
+        if deadline is not None and time.time() > deadline:
+            break
         try:
             page_html, _ = fetch_page(base_url.rstrip("/") + path)
             if page_html:
@@ -993,9 +998,18 @@ def score_quality(score):
 #   ok / no_email / not_shopify / password / name_mismatch / no_products / error
 # ============================================================
 
-def analyze_store(domain, store_name, source_app):
+def analyze_store(domain, store_name, source_app, deadline=None):
+    """'deadline' diya ho aur beech me time khatam ho jaye to 'timeout' return hota hai —
+    is candidate ko is run me chhod diya jata hai (agli run me dobara try hoga), taake
+    ek slow/hanging domain poora executor ko run_deadline se aage na ghaseet le jaye."""
+
+    def past_deadline():
+        return deadline is not None and time.time() > deadline
+
     try:
         html, final_url = fetch_page(normalize_url(domain))
+        if past_deadline():
+            return "timeout", None
         if not html or not detect_shopify(html):
             return "not_shopify", None
 
@@ -1012,10 +1026,14 @@ def analyze_store(domain, store_name, source_app):
         base_url = normalize_url(final_url)
 
         product_count = get_product_count(base_url)
+        if past_deadline():
+            return "timeout", None
         if product_count < MIN_PRODUCTS:
             return "no_products", None
 
-        combined_text = fetch_extra_pages(base_url, html)
+        combined_text = fetch_extra_pages(base_url, html, deadline)
+        if past_deadline():
+            return "timeout", None
 
         ranked = rank_emails(collect_emails(combined_text), final_domain, store_name)
         email = next((e for e in ranked if domain_has_mx(e.split("@")[1])), "")
@@ -1072,9 +1090,11 @@ def process_store_name(name, handle, guesses, deadline):
     for domain in guesses:
         if time.time() > deadline:
             return "timeout", None, reasons
-        status, data = analyze_store(domain, name, handle)
+        status, data = analyze_store(domain, name, handle, deadline)
         if status in ("ok", "no_email"):
             return status, data, reasons
+        if status == "timeout":
+            return "timeout", None, reasons
         reasons[status] += 1
     return "not_found", None, reasons
 
@@ -1346,7 +1366,20 @@ def run_once():
                 for name, handle, guesses in todo
             }
 
-            for future in as_completed(futures):
+            # Hard safety-net: as_completed() ko khud ek overall timeout diya hai.
+            # Individual candidates ab run_deadline khud check karte hain (upar
+            # analyze_store / process_store_name me), lekin agar phir bhi kuch
+            # atka reh jaye, ye guarantee karta hai ke poora analysis phase kabhi
+            # run_deadline se zyada wall-clock time nahi lega — GitHub Actions ke
+            # apne timeout-minutes se pehle hi Python khud gracefully ruk jayega
+            # aur jo mil chuka hai wo flush() kar dega.
+            remaining = max(1, run_deadline - time.time())
+            try:
+                completed_iter = as_completed(futures, timeout=remaining)
+            except TimeoutError:
+                completed_iter = iter(())
+
+            for future in completed_iter:
                 name = futures[future]
 
                 try:
@@ -1394,6 +1427,12 @@ def run_once():
                 if completed % CHECKPOINT_INTERVAL == 0:
                     flush()
                     logger.info("Checkpoint saved at %s/%s.", completed, len(todo))
+
+            if time.time() > run_deadline:
+                logger.warning(
+                    "Run time budget khatam — baaki candidates process nahi hue, "
+                    "unke naam agli run me dobara try honge."
+                )
 
         except KeyboardInterrupt:
             logger.warning("Interrupted — ab tak ka data save kar raha hun...")
