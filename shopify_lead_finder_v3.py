@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3.3 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.4 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -23,6 +23,36 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
+-------------------------------------------------------------------------------
+CHANGELOG v3.4 — FIX: GitHub ka apna annotation confirm karta hai "The job
+has exceeded the maximum execution time of 1h0m0s" — matlab humara apna
+50-min watchdog KABHI fire hi nahi hua tha, process poore 60 min tak khamosh
+raha, phir GitHub ne bahar se force-kill kiya.
+-------------------------------------------------------------------------------
+Root cause: v3.3 tak ka watchdog ek plain threading.Thread tha jo pehle
+`logger.error(...)` call karta phir `os._exit(1)`. Masla: agar koi DUSRA
+thread Python ke `logging` module ki internal lock pakde hue ho (misal ke
+taur par kisi stuck stdout write ki wajah se — jaisa GitHub Actions ki log
+streaming me kabhi-kabhi hota hai), to watchdog ka apna `logger.error()` call
+BHI usi lock par wait karte hue phas jata hai. Matlab humara "kabhi na
+atakne wala" akhri safety net khud atak sakta tha — isi liye kisi bhi purani
+run ke log me "HARD TIMEOUT" wala message kabhi print hi nahi hua, sirf
+khamoshi rahi jab tak GitHub ki apni 60-min job limit khatam na ho gayi.
+
+FIX: watchdog ko Python ke built-in `faulthandler.dump_traceback_later(
+timeout, exit=True)` se replace kiya. Ye function humari `logging` module ki
+lock bilkul use nahi karta — seedha low-level C code se file descriptor par
+likhta hai — isliye stuck logging lock se bilkul azad hai. Timeout par ye
+khud (1) HAR thread ka poora stack trace print karta hai aur (2) khud
+`os._exit(1)` call karta hai, hamare apne kisi bhi code path par depend kiye
+bagair. Agar run waqt se pehle mukammal ho jaye, ise `cancel_dump_traceback_
+later()` se cancel kar dete hain (har return path par, aur RUN_FOREVER loop
+ke crash-handler me bhi).
+
+Agli baar agar phir bhi 50 min tak atka rahe (bohot kam chance hai), GitHub
+Actions ke log me is dafa GUARANTEED taur par har thread ka exact stack
+trace dikhega — us se 100% pata chal jayega asal wajah kya hai, koi guess
+nahi karna paray ga.
 -------------------------------------------------------------------------------
 CHANGELOG v3.3 — FIX: v3.2 ke baad bhi kuch der (25+ min) baad total sannata
 ho jata tha (koi warning bhi nahi, heartbeat bhi nahi)
@@ -1648,22 +1678,9 @@ def save_apps_state(apps_ws, state, updates):
 # ============================================================
 # ONE RUN
 # ============================================================
-
-def _watchdog_force_exit(minutes):
-    """Aakhri safety net: agar koi cheez (unknown bug, network trickle, DNS hang)
-    is process ko itni der rok le, to process khud khatam ho jata hai — GitHub
-    ke forceful 'cancelled' (jisme koi diagnostic log nahi milta) ka intezar
-    nahi karta. Data loss minimal hota hai kyunke leads har CHECKPOINT_INTERVAL
-    par pehle hi sheet me save ho chuki hoti hain."""
-    time.sleep(minutes * 60)
-    logger.error(
-        "HARD TIMEOUT (%.0f min) — process kahin atka hua tha, isliye zabardasti "
-        "exit kar raha hun. Ab tak jo leads mil chuki thin wo already save hain. "
-        "Agli run automatically aage se shuru hogi.",
-        minutes
-    )
-    logging.shutdown()
-    os._exit(1)
+# (v3.4: watchdog ab faulthandler.dump_traceback_later() se chalta hai —
+# dekho run_once() ke shuru me. Purana threading.Thread wala watchdog hata
+# diya gaya hai, kyunke wo khud stuck logging lock ka shikar ho sakta tha.)
 
 
 def run_once():
@@ -1673,12 +1690,35 @@ def run_once():
     run_deadline = t0 + RUN_TIME_BUDGET_MINUTES * 60
     hard_minutes = HARD_TIMEOUT_MINUTES if HARD_TIMEOUT_MINUTES > 0 else (RUN_TIME_BUDGET_MINUTES + 5)
 
-    watchdog = threading.Thread(target=_watchdog_force_exit, args=(hard_minutes,), daemon=True)
-    watchdog.start()
+    # v3.4: PEHLE (v3.3 tak) ye ek threading.Thread thi jo `logger.error(...)`
+    # call karti thi phir `os._exit(1)`. Masla ye tha ke agar koi DUSRA thread
+    # logging module ka internal lock pakde hue ho (jaisa ke koi stuck stdout
+    # write, misal ke taur par GitHub Actions ki log-streaming me koi glitch),
+    # to is watchdog ka apna `logger.error()` call BHI wahin phas jata — matlab
+    # humara "kabhi na atakne wala" safety net khud atak jata tha. Isi liye
+    # kisi bhi purani run me "HARD TIMEOUT" wala message kabhi print hi nahi
+    # hua — watchdog chalti thi, uska apna print hi stuck ho jata tha, aur
+    # akhir GitHub apni 60-min job-level limit par khud process mar deta tha
+    # (bilkul jaisa annotation "exceeded the maximum execution time of 1h0m0s"
+    # confirm karta hai).
+    #
+    # FIX: Python ke apne `faulthandler.dump_traceback_later(timeout, exit=True)`
+    # par switch — ye humari `logging` module ki lock BILKUL use nahi karta
+    # (seedha low-level C code se file descriptor par likhta hai), isliye
+    # stuck logging lock se bilkul azad hai. Timeout par ye khud (1) har
+    # thread ka poora stack trace print karta hai aur (2) khud `os._exit(1)`
+    # call karta hai — hamare apne code ke kisi bhi hisse par depend kiye
+    # bagair. Agar run waqt se pehle mukammal ho jaye, hum ise cancel kar
+    # dete hain (har return se pehle, neeche dekho).
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+    faulthandler.dump_traceback_later(hard_minutes * 60, repeat=False, file=sys.stderr, exit=True)
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3.3 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        "SHOPIFY LEAD FINDER v3.4 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
         RUN_TIME_BUDGET_MINUTES, hard_minutes
     )
     logger.info(
@@ -1696,6 +1736,7 @@ def run_once():
     if tabs is None:
         if REQUIRE_SHEET:
             logger.error("Sheet connect nahi hui, isliye run ruk gaya (REQUIRE_SHEET=0 set karein to CSV-only chalega).")
+            faulthandler.cancel_dump_traceback_later()
             return 1
         logger.warning("Sheet ke baghair CSV-only mode me chal raha hun: %s", LEADS_CSV_FILE)
 
@@ -1725,11 +1766,13 @@ def run_once():
     # ---------------- DYNAMIC APP DISCOVERY + REVIEW SCRAPING ----------------
     if not BS4_AVAILABLE:
         logger.error("beautifulsoup4 install nahi hai. Run: pip install beautifulsoup4")
+        faulthandler.cancel_dump_traceback_later()
         return 1
 
     sitemap_apps = discover_app_handles()
     if not sitemap_apps:
         logger.error("Shopify App Store se koi app nahi mili (network / block?). Agli run me dobara try hoga.")
+        faulthandler.cancel_dump_traceback_later()
         return 1
 
     plan, plan_counts = plan_apps(sitemap_apps, apps_state)
@@ -1917,6 +1960,7 @@ def run_once():
         1 for h, _, k in plan if k == "new" and h in app_updates), 0))
     logger.info("CSV backup: %s", LEADS_CSV_FILE)
     logger.info("=" * 70)
+    faulthandler.cancel_dump_traceback_later()
     return 0
 
 
@@ -1938,6 +1982,15 @@ def main():
             return
         except Exception as e:
             logger.exception("Run crashed: %s", str(e))
+        finally:
+            # Agar run_once() kisi anjaan exception se crash ho (upar wale
+            # explicit return points se nahi guzra), to bhi watchdog ko
+            # cancel karna zaruri hai — warna wo agli sleep/run cycle ke
+            # beech me galat waqt par fire ho sakta hai.
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
         sleep_for = max(60, RUN_EVERY_MINUTES * 60 - (time.time() - started))
         logger.info("Agli run %.0f minute baad.", sleep_for / 60)
         try:
