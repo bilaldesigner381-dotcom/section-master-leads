@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3.2 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.3 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -23,6 +23,40 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
+-------------------------------------------------------------------------------
+CHANGELOG v3.3 — FIX: v3.2 ke baad bhi kuch der (25+ min) baad total sannata
+ho jata tha (koi warning bhi nahi, heartbeat bhi nahi)
+-------------------------------------------------------------------------------
+v3.2 ka fix (neeche wala changelog) sahi soch tha lekin thora adhoora tha:
+`_http_executor` ke andar jo bhi thread kisi HANGING DNS lookup par lag jaye,
+wo thread HAMESHA KE LIYE zaya ho jata hai (Python threads force-kill nahi ho
+saktin) — chahe calling worker `future.result(timeout=...)` se azad ho kar
+agli domain try kar le. v3.2 wale hi run ka apna log iski gawahi de raha tha:
+"http-pool: 90 threads active" — sirf 51/3004 names complete hone tak, jabke
+_http_executor ki poori capacity 100 thi. Jab ye pool mukammal bhar gaya, to
+har naya bounded_get() call bas queue me pada reh gaya — kabhi shuru hi nahi
+hua — is liye ab koi warning bhi print nahi hui (kyunke jo task shuru hi
+nahi hua, uske "timeout" ka koi standalone event nahi hota, bas sab kuch
+khamosh ho gaya).
+
+Asal masla socket.getaddrinfo() (DNS resolution) hai — is par `requests` ka
+`timeout=` ya `socket.setdefaulttimeout()` KISI KA BHI koi asar nahi hota.
+Ye Google Sheets (gspread) calls ke liye bhi bilkul unprotected tha.
+
+FIX: `socket.getaddrinfo` ko khud, poore process ke liye, EK HI JAGAH
+monkey-patch kiya — bilkul wahi "disposable thread + future.result(timeout=
+...)" pattern jo domain_has_mx() ke liye pehle se prove ho chuka hai. Ab jab
+koi lookup hangs ho, sirf EK chhota, alag, disposable thread (is ke apne
+300-thread pool me) zaya hota hai — kabhi bhi _http_executor, _dns_executor,
+ya gspread ke apne connection pool ka koi thread nahi. Ye ek patch poore
+process ke har network call ko uski ASAL jaga par protect karta hai —
+Google Sheets calls samet.
+
+Bonus (diagnostic safety net): agar ab bhi kabhi 90 second (3 heartbeats)
+tak koi naya store complete na ho, script khud "STALL DETECTED" likh kar
+`faulthandler.dump_traceback()` se HAR thread ka exact stack trace print kar
+degi. Isse agli baar (agar kabhi kuch atka) guess nahi karna paray ga —
+seedha pata chal jayega konsi line par konsa thread ruka hua hai.
 -------------------------------------------------------------------------------
 CHANGELOG v3.2 — FIX: run "bilkul stuck" ho jati thi, koi lead nahi, phir GitHub
 khud 1 ghante baad forceful cancel kar deta tha (koi log nahi)
@@ -117,6 +151,7 @@ import socket
 import html as html_lib
 import logging
 import threading
+import faulthandler
 import requests
 
 from collections import Counter, namedtuple
@@ -153,6 +188,60 @@ except ImportError:
 # timeout (our own requests.get(..., timeout=...)) are unaffected by this —
 # this only kicks in when nothing else would.
 socket.setdefaulttimeout(20)
+
+
+# ============================================================
+# GLOBAL DNS HARD-TIMEOUT (v3.3 — fixes freezes that survived v3.2)
+# ============================================================
+# v3.2 wrapped bounded_get()'s requests.get() call in its own dedicated
+# thread-pool (_http_executor) with a hard timeout. That correctly freed up
+# the CALLING worker whenever a DNS lookup hung — but the _http_executor
+# thread that actually ran the hung requests.get() call was consumed
+# PERMANENTLY (Python threads can't be force-killed). The v3.2 run's own log
+# proved this: "http-pool: 90 threads active" after only 51/3004 names —
+# the 100-thread pool was already almost entirely full of permanently-stuck
+# threads. Once it filled up completely, every NEW bounded_get() call just
+# sat queued behind the dead threads forever, recreating the exact same
+# freeze as before — just delayed instead of immediate, and with total
+# silence (no more warnings could fire, because the tasks never even started
+# running, so future.result(timeout=...) was waiting on a task stuck in the
+# executor's queue, not a task that had started and could be abandoned).
+#
+# The real blocking call is socket.getaddrinfo() (DNS resolution) — and
+# NOTHING bounds it: not requests' timeout=, not socket.setdefaulttimeout().
+# It's also used by gspread/Google Sheets calls, which had ZERO protection
+# until now.
+#
+# Fix: monkey-patch socket.getaddrinfo itself, process-wide, using the exact
+# "run in a disposable thread + future.result(timeout=...)" pattern already
+# proven for domain_has_mx(). This way, when a lookup hangs, only ONE cheap
+# throwaway thread in this small dedicated pool is lost — never a thread
+# from _http_executor, _dns_executor, or gspread's own connection pool. This
+# single patch protects every network call in the whole process at its true
+# source, including Google Sheets.
+GETADDRINFO_HARD_TIMEOUT_SECONDS = float(os.environ.get("GETADDRINFO_HARD_TIMEOUT_SECONDS", "6"))
+GETADDRINFO_POOL_SIZE = int(os.environ.get("GETADDRINFO_POOL_SIZE", "300"))
+_getaddrinfo_executor = ThreadPoolExecutor(
+    max_workers=GETADDRINFO_POOL_SIZE, thread_name_prefix="getaddrinfo"
+)
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _bounded_getaddrinfo(*args, **kwargs):
+    future = _getaddrinfo_executor.submit(_orig_getaddrinfo, *args, **kwargs)
+    try:
+        return future.result(timeout=GETADDRINFO_HARD_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        # Asal lookup abhi bhi kahin phasi hogi (is chhoti disposable pool
+        # me) — hum yahan se turant ek normal DNS-failure jaisa error raise
+        # karte hain, taake requests/gspread apna maujooda error-handling
+        # khud use kar lein (koi special-casing chahiye nahi kisi caller me).
+        raise socket.gaierror(
+            -3, f"getaddrinfo hard-timeout after {GETADDRINFO_HARD_TIMEOUT_SECONDS}s: {args[:2]}"
+        )
+
+
+socket.getaddrinfo = _bounded_getaddrinfo
 
 
 # ============================================================
@@ -1589,7 +1678,7 @@ def run_once():
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3.2 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        "SHOPIFY LEAD FINDER v3.3 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
         RUN_TIME_BUDGET_MINUTES, hard_minutes
     )
     logger.info(
@@ -1693,12 +1782,35 @@ def run_once():
             # Sirf visibility ke liye — koi logic yahan nahi. Ab se log kabhi
             # HEARTBEAT_SECONDS se zyada der chup nahi rahega, chahe koi store
             # slow ho ya sab workers busy hon — pehle iski koi khabar nahi milti thi.
+            #
+            # v3.3: agar 3 heartbeats (~90s) tak "done" count bilkul na badle,
+            # to ye maan lete hain ke kahin genuinely atak gaya hai — us waqt
+            # HAR thread ka exact stack trace print kar dete hain, taake agli
+            # baar guess nahi karna paray, seedha maloom ho jaye kahan ruka hai.
+            last_done, stall_count, dumped = -1, 0, False
             while not stop_heartbeat.wait(HEARTBEAT_SECONDS):
                 logger.info(
                     "... jaari hai: %s/%s store names complete (kaam chal raha hai, atka nahi) | "
-                    "http-pool: %s threads active",
+                    "total threads: %s",
                     progress["done"], progress["total"], threading.active_count()
                 )
+                if progress["done"] == last_done:
+                    stall_count += 1
+                else:
+                    stall_count, dumped = 0, False
+                last_done = progress["done"]
+
+                if stall_count >= 3 and not dumped:
+                    dumped = True   # ek run me sirf ek baar dump — spam se bachne ke liye
+                    logger.error(
+                        "STALL DETECTED — %s heartbeats (~%.0fs) se koi naya store complete "
+                        "nahi hua. Har thread ka exact stack trace neeche (debugging ke liye):",
+                        stall_count, stall_count * HEARTBEAT_SECONDS
+                    )
+                    try:
+                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                    except Exception as e:
+                        logger.error("Stack trace dump fail: %s", str(e))
 
         threading.Thread(target=_heartbeat, daemon=True).start()
 
