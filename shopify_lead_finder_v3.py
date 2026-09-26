@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3.1 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.2 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -23,6 +23,45 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
+-------------------------------------------------------------------------------
+CHANGELOG v3.2 — FIX: run "bilkul stuck" ho jati thi, koi lead nahi, phir GitHub
+khud 1 ghante baad forceful cancel kar deta tha (koi log nahi)
+-------------------------------------------------------------------------------
+Root cause (v3.1 wale DNS bug ki "jud/twin", ek aur jagah): `domain_has_mx()`
+ke liye to hum ne pehle hi (v3.1 me) fix kar diya tha ke DNS lookup kabhi
+poore pipeline ko block na kare. LEKIN `bounded_get()` — jo `fetch_page`,
+`get_product_count`, review-page fetch, sab kuch use karta hai — abhi bhi
+seedha `requests.get(url, timeout=(connect, read))` call karta tha.
+
+Masla ye hai ke `requests`/`urllib3` ka `timeout=` parameter sirf socket
+CONNECT aur READ ko bound karta hai — lekin us se PEHLE jo `socket.getaddrinfo()`
+(DNS resolution) hoti hai, wo is timeout se bilkul independent hai. Agar kisi
+guessed domain (jaise `storename.com` — jinme se zyadatar wajood hi nahi
+rakhte ya ajeeb DNS setup wale parked/dead registrars par hote hain) ki DNS
+lookup kahin phas jaye, to us worker thread ko koi bhi `timeout=` value wapas
+nahi la sakti — chahe wo 10 second ho ya 20.
+
+25 parallel workers jab sath sath bohot saare (mostly-invalid) guessed
+domains resolve karne ki koshish karte hain, to dheere dheere zyada workers
+isi trap me phasty jate hain. Jab saare phas jayein: koi naya store process
+nahi hota, koi naya lead print nahi hota, heartbeat sirf shuru ke 1-2 baar
+chalti hai (jab tak koi worker free hai) phir wo bhi ruk jati hai — aur akhir
+me hamara apna 50-minute watchdog ya GitHub Actions ka apna 1-hour forceful
+cancel (bina kisi diagnostic log ke) chal jata hai.
+
+FIX: `bounded_get()` ke andar ka asal `requests.get(...)` call ab ek dedicated
+thread-pool (`_http_executor`) me submit hota hai aur `future.result(timeout=
+hard_timeout + buffer)` se HARD wall-clock cap ke sath bandha hai — bilkul
+`domain_has_mx()` wala hi pattern. Agar underlying request (DNS/connect/read,
+kuch bhi) kahin phas jaye, calling worker turant `FutureTimeoutError` le kar
+wapas aa jata hai aur agla store try karta hai — pipeline kabhi block nahi
+hota. (Note: Python threads force-kill nahi ho sakti, isliye stuck thread khud
+background me zinda reh sakti hai — is liye `_http_executor` ka pool
+`MAX_WORKERS` se kaafi bara (4x) rakha gaya hai, taake stuck threads jama hone
+par bhi naye kaam ke liye jagah bani rahe.)
+
+Baaqi POORI script (v3.1) waisi ki waisi hai — sirf `bounded_get()` function
+aur ek naya `_http_executor` + `_do_bounded_get_request()` helper add hua hai.
 -------------------------------------------------------------------------------
 CHANGELOG v3.1 — FIX: script "stuck ho jati thi" bug
 -------------------------------------------------------------------------------
@@ -274,16 +313,65 @@ def is_bad_domain(domain):
 # closes that hole: it streams the response and checks TOTAL elapsed wall
 # time after every chunk, aborting hard if the cap is crossed — regardless
 # of how the server paces its bytes.
+#
+# v3.2: on top of that, `requests`' `timeout=` NEVER bounds DNS resolution
+# (socket.getaddrinfo happens before any socket/timeout exists). A hung DNS
+# lookup on a guessed/junk domain can block a worker forever no matter what
+# hard_timeout says. So the actual request now runs inside a dedicated
+# executor and is bounded from the OUTSIDE with future.result(timeout=...) —
+# the exact same pattern already used for domain_has_mx() below. See the
+# v3.2 changelog at the top of this file for the full story.
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 Chrome/131 Safari/537.36"
 )
 
+# Dedicated pool for the actual HTTP work. Sized larger than MAX_WORKERS on
+# purpose: since a stuck DNS lookup leaves its thread occupied forever
+# (Python threads can't be force-killed), a pool sized exactly to
+# MAX_WORKERS would eventually fill up with stuck threads and start
+# queueing new requests behind them — recreating the exact freeze we're
+# fixing. A 4x pool gives plenty of headroom for stuck threads to
+# accumulate over a run while fresh requests still get a free thread.
+HTTP_EXECUTOR_WORKERS = int(os.environ.get("HTTP_EXECUTOR_WORKERS", str(MAX_WORKERS * 4)))
+_http_executor = ThreadPoolExecutor(max_workers=HTTP_EXECUTOR_WORKERS, thread_name_prefix="http-fetch")
+
+
+def _do_bounded_get_request(url, params, req_headers, hard_timeout, max_bytes):
+    """Actual (potentially slow / DNS-hanging) network work — runs inside
+    _http_executor. Returns (status_code, text, final_url) or raises."""
+    resp = None
+    try:
+        start = time.time()
+        resp = requests.get(
+            url, params=params, headers=req_headers, stream=True,
+            timeout=(min(hard_timeout, 10), hard_timeout),
+            allow_redirects=True,
+        )
+        chunks, total = [], 0
+        for chunk in resp.iter_content(chunk_size=8192):
+            if time.time() - start > hard_timeout:
+                raise TimeoutError(f"bounded_get: {hard_timeout}s cap crossed (trickle?) for {url}")
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    break
+        body = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+        return resp.status_code, body, resp.url
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
 
 def bounded_get(url, params=None, headers=None, hard_timeout=None, retries=1,
                  retry_sleep=1.5, max_bytes=8_000_000):
-    """GET jo total wall-clock time ko HARD cap karta hai (trickle-safe).
+    """GET jo total wall-clock time ko HARD cap karta hai (trickle-safe AND
+    DNS-hang-safe — see v3.2 changelog above).
     Returns a lightweight object with .status_code, .text, .url — ya None
     agar fetch fail/timeout ho jaye."""
     hard_timeout = hard_timeout if hard_timeout is not None else NETWORK_HARD_TIMEOUT_SECONDS
@@ -298,36 +386,28 @@ def bounded_get(url, params=None, headers=None, hard_timeout=None, retries=1,
             self.url = url
 
     for attempt in range(max(1, retries)):
-        start = time.time()
-        resp = None
         try:
-            resp = requests.get(
-                url, params=params, headers=req_headers, stream=True,
-                timeout=(min(hard_timeout, 10), hard_timeout),
-                allow_redirects=True,
+            future = _http_executor.submit(
+                _do_bounded_get_request, url, params, req_headers, hard_timeout, max_bytes
             )
-            chunks, total = [], 0
-            for chunk in resp.iter_content(chunk_size=8192):
-                if time.time() - start > hard_timeout:
-                    raise TimeoutError(f"bounded_get: {hard_timeout}s cap crossed (trickle?) for {url}")
-                if chunk:
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total > max_bytes:
-                        break
-            body = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
-            return _Result(resp.status_code, body, resp.url)
+            # +5s buffer so our own outer cap always fires strictly after the
+            # inner per-chunk cap would have (never tighter than it).
+            status_code, text, final_url = future.result(timeout=hard_timeout + 5)
+            return _Result(status_code, text, final_url)
+        except FutureTimeoutError:
+            # Request (most likely DNS resolution) is still stuck somewhere
+            # inside _http_executor. We do NOT wait for it — we give up on
+            # this attempt immediately so the calling worker is freed up.
+            # The stuck background thread will linger (can't be killed) but
+            # no longer blocks the pipeline.
+            logger.warning(
+                "bounded_get: HARD timeout (%.0fs) — DNS/connect kahin phas gaya lagta hai: %s",
+                hard_timeout, url
+            )
         except Exception:
-            if attempt < retries - 1:
-                time.sleep(retry_sleep)
-                continue
-            return None
-        finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+            pass
+        if attempt < retries - 1:
+            time.sleep(retry_sleep)
     return None
 
 
@@ -1002,7 +1082,7 @@ def rank_emails(found, store_domain, store_name):
 # ------------------------------------------------------------
 # Ye pehle @lru_cache use karti thi, jiska ek SINGLE GLOBAL LOCK hota hai —
 # concurrent cache-misses (chahe alag-alag domains ke liye) ek-dusre ko
-# BLOCK karte the. Agar ek domain ki DNS lookup kahin phans jaye, saare
+# BLOCK karte the. Agar ek domain ki DNS lookup kahin phas jaye, saare
 # workers isi lock ke peeche queue ho kar poori script ko freeze kar dete
 # the. Ab: (1) cache sirf ek dict+lock hai jo sirf read/write lock karta hai,
 # DNS call ko nahi, aur (2) har lookup ek dedicated thread-pool me chalti hai
@@ -1509,7 +1589,7 @@ def run_once():
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3.1 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        "SHOPIFY LEAD FINDER v3.2 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
         RUN_TIME_BUDGET_MINUTES, hard_minutes
     )
     logger.info(
@@ -1615,8 +1695,9 @@ def run_once():
             # slow ho ya sab workers busy hon — pehle iski koi khabar nahi milti thi.
             while not stop_heartbeat.wait(HEARTBEAT_SECONDS):
                 logger.info(
-                    "... jaari hai: %s/%s store names complete (kaam chal raha hai, atka nahi)",
-                    progress["done"], progress["total"]
+                    "... jaari hai: %s/%s store names complete (kaam chal raha hai, atka nahi) | "
+                    "http-pool: %s threads active",
+                    progress["done"], progress["total"], threading.active_count()
                 )
 
         threading.Thread(target=_heartbeat, daemon=True).start()
