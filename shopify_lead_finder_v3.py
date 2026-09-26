@@ -24,6 +24,53 @@ Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
 -------------------------------------------------------------------------------
+CHANGELOG v3.6 — FIX: v3.5 ke baad bhi stuck ho raha tha, aur is dafa HEARTBEAT
+BHI print nahi ho rahi thi (pehle heartbeat kam az kam chalti rehti thi).
+-------------------------------------------------------------------------------
+Ye naya symptom (heartbeat ka bhi rukna) important clue hai: ab masla kisi EK
+network call ka nahi, poori PROCESS ka hai.
+
+Root cause: v3.1-v3.5 ke har fix ne ek naya "disposable thread + hard
+timeout" pool add kiya taake koi bhi stuck OS call baaqi sab ko block na
+kare — `_getaddrinfo_executor` (300 threads), `_http_executor` (100 threads,
+MAX_WORKERS×4), `_dns_executor` (8), aur main analysis pool (25). Ye sab
+apni jagah sahi approach hai, lekin jab network genuinely repeatedly hang
+karta hai (jo v3.4-v3.5 ke dumps me confirm ho chuka), to har hang wala
+call apna thread PERMANENTLY le leta hai — us thread ko wapas nahi mil
+sakta (Python threads force-kill nahi ho sakte). In sab pools ko milakar
+theoretically 433 tak threads ek saath zinda ho sakte hain, har ek apne
+DEFAULT 8MB stack ke sath — matlab worst case ~3.5GB sirf thread stacks
+ke liye. Ek chhote GitHub-hosted runner (2 vCPU, ~7GB RAM) par itni
+memory/scheduling pressure poori Python process ko itna slow kar deti hai
+ke wo "freeze" jaisi lagti hai — aur `logging` module ka internal lock
+(jo HAR `logger.info()` call, heartbeat samet, use karta hai) is pressure
+ke andar itni der tak grab hui reh sakti hai ke heartbeat tak print nahi
+hoti.
+
+FIX (do hisson me):
+  1. `threading.stack_size(1 MB)` set kiya — ye sab I/O-bound calls hain
+     (koi deep recursion nahi), is liye 1MB kaafi zyada hai. Isse SAME
+     thread count par total memory footprint ~8x kam ho jata hai.
+  2. `HTTP_EXECUTOR_WORKERS` aur `GETADDRINFO_POOL_SIZE` ke defaults kaafi
+     kam kar diye (100->50, 300->75) — kisi bhi waqt sirf ~MAX_WORKERS
+     (25) concurrent chains hi active hoti hain (har main-pool worker ek
+     waqt me sirf ek hi bounded_get/getaddrinfo call karta hai), isliye
+     itne bade pools ki zaroorat hi nahi thi — wo sirf worst-case ka
+     "kitni der tak leak chalega" number badha rahe the, asal leak nahi
+     rok rahe the.
+  3. Logging ko `logging.handlers.QueueHandler` + `QueueListener` se
+     decouple kiya. Ab koi bhi thread `logger.info()` call kare to sirf
+     ek in-memory queue me record daalta hai (ye kabhi block NAHI hoti —
+     `queue.Queue` ka `put()` unbounded queue par instant hai), aur ek
+     ALAG dedicated listener thread hi asal stderr write karta hai. Isse
+     agar kabhi output pipe slow/stuck ho (GitHub Actions ki log
+     streaming me kabhi hota hai), sirf woh EK listener thread affect
+     hoga — koi bhi application thread (heartbeat, workers) us wajah se
+     kabhi block nahi hogi. Ye poori tarah se ek alag, safe fix hai jo
+     v3.4 ke faulthandler-watchdog wale masle se milta julta hai lekin
+     ab NORMAL application logging ko bhi cover karta hai, sirf watchdog
+     ko nahi.
+-------------------------------------------------------------------------------
 CHANGELOG v3.5 — FIX: v3.4 ke faulthandler watchdog ne PEHLI DAFA sahi tarah
 kaam kiya (50 min pe khud ruki, har thread ka stack trace mila) — us dump se
 asal wajah mil gayi: ye deadlock NAHI tha, ek "time-budget leak" tha.
@@ -109,9 +156,11 @@ import sys
 import csv
 import json
 import time
+import queue
 import socket
 import html as html_lib
 import logging
+import logging.handlers
 import threading
 import faulthandler
 import requests
@@ -121,6 +170,21 @@ from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import (
     ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 )
+
+
+# ============================================================
+# SMALLER THREAD STACKS (v3.6)
+# ============================================================
+# Sab threads yahan I/O-bound hain (network calls) — koi deep recursion
+# nahi. Default OS stack (Linux par 8MB) zaroorat se bohot zyada hai.
+# Jab network hang ki wajah se kayi threads permanently zinda reh jaate
+# hain (dekho CHANGELOG v3.6), to total memory footprint stack size ke
+# seedha proportional hota hai — is liye ise chhota rakhna zaroori hai.
+# MUST run before ANY thread is created, isliye file ke bilkul upar hai.
+try:
+    threading.stack_size(1024 * 1024)   # 1 MB (default ~8 MB)
+except (ValueError, RuntimeError):
+    pass   # kuch platforms par unsupported — safe fallback: default stack
 
 try:
     import gspread
@@ -152,7 +216,10 @@ socket.setdefaulttimeout(20)
 # GLOBAL DNS HARD-TIMEOUT (v3.3)
 # ============================================================
 GETADDRINFO_HARD_TIMEOUT_SECONDS = float(os.environ.get("GETADDRINFO_HARD_TIMEOUT_SECONDS", "6"))
-GETADDRINFO_POOL_SIZE = int(os.environ.get("GETADDRINFO_POOL_SIZE", "300"))
+# v3.6: 300 se ghata kar 75 kiya — kisi bhi waqt sirf ~MAX_WORKERS (25)
+# concurrent calls hi asal me zaroori hote hain; bada pool sirf leak ka
+# "delay" badhata tha, asal masla (memory) nahi rokta tha (CHANGELOG v3.6).
+GETADDRINFO_POOL_SIZE = int(os.environ.get("GETADDRINFO_POOL_SIZE", "75"))
 _getaddrinfo_executor = ThreadPoolExecutor(
     max_workers=GETADDRINFO_POOL_SIZE, thread_name_prefix="getaddrinfo"
 )
@@ -248,13 +315,40 @@ SheetTabs = namedtuple("SheetTabs", "leads no_email apps checked")
 
 
 # ============================================================
-# LOGGING
+# LOGGING (v3.6: queue-decoupled — dekho CHANGELOG v3.6)
 # ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+# Purana `logging.basicConfig()` seedha ek StreamHandler use karta tha —
+# har `logger.info()` call (heartbeat samet) ek shared lock leta hai aur
+# KHUD stderr par write karta hai. Agar wo write kabhi slow/stuck ho
+# (memory pressure, GitHub Actions ki log-pipe backpressure, waghera),
+# to lock hold hone ki wajah se SAB threads ka agla logger.* call bhi
+# block ho jata hai — heartbeat samet.
+#
+# FIX: har thread ab sirf ek in-memory `queue.Queue` me record daalta hai
+# (`put()` unbounded queue par kabhi block nahi hoti, chahe kuch bhi ho
+# raha ho). Ek ALAG dedicated listener thread hi is queue se records
+# uthakar asal stderr write karta hai. Isse agar kabhi write slow ho, sirf
+# wahi ek listener thread affect hota hai — application ki koi bhi thread
+# (heartbeat, workers) kabhi is wajah se block nahi hogi.
+_log_queue = queue.Queue(-1)   # unbounded — put() kabhi block nahi hoga
+_log_stream_handler = logging.StreamHandler(sys.stderr)
+_log_stream_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 )
+_log_listener = logging.handlers.QueueListener(
+    _log_queue, _log_stream_handler, respect_handler_level=True
+)
+_log_listener.start()
+
+_queue_handler = logging.handlers.QueueHandler(_log_queue)
+# QueueHandler apna record queue me daalne se pehle khud bhi ek default
+# formatter (level:name:message) laga deta hai (taake record cross-process
+# queue ke liye picklable rahe) — agar isay explicitly "%(message)s" na
+# diya jaye to message do dafa format ho jata hai (ek dafa yahan, ek dafa
+# neeche listener ke _log_stream_handler me), aur output me
+# "asctime | INFO | INFO:name:message" jaisi duplication dikhti hai.
+_queue_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_queue_handler])
 logger = logging.getLogger("shopify-lead-finder")
 
 
@@ -314,7 +408,9 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 Chrome/131 Safari/537.36"
 )
 
-HTTP_EXECUTOR_WORKERS = int(os.environ.get("HTTP_EXECUTOR_WORKERS", str(MAX_WORKERS * 4)))
+# v3.6: MAX_WORKERS*4 (100) se MAX_WORKERS*2 (50) kiya — same wajah jaisi
+# GETADDRINFO_POOL_SIZE ki (CHANGELOG v3.6).
+HTTP_EXECUTOR_WORKERS = int(os.environ.get("HTTP_EXECUTOR_WORKERS", str(MAX_WORKERS * 2)))
 _http_executor = ThreadPoolExecutor(max_workers=HTTP_EXECUTOR_WORKERS, thread_name_prefix="http-fetch")
 
 
@@ -1517,8 +1613,9 @@ def run_once():
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3.5 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
-        RUN_TIME_BUDGET_MINUTES, hard_minutes
+        "SHOPIFY LEAD FINDER v3.6 — dynamic apps | email mandatory | budget %s min | hard timeout %s min "
+        "| http-pool %s | getaddrinfo-pool %s | thread-stack 1MB",
+        RUN_TIME_BUDGET_MINUTES, hard_minutes, HTTP_EXECUTOR_WORKERS, GETADDRINFO_POOL_SIZE
     )
     logger.info(
         "NOTE: agar GitHub Actions me chala rahe ho, workflow 'timeout-minutes' ko %s se zyada rakho, "
