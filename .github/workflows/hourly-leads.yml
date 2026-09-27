@@ -45,6 +45,9 @@ jobs:
 
       - name: Run lead finder (with live py-spy thread-dump monitoring)
         run: |
+          PYSPY="$(command -v py-spy)"
+          echo "py-spy path: $PYSPY"
+
           python shopify_lead_finder_v3.py &
           PY_PID=$!
           echo "Script chal rahi hai, PID: $PY_PID"
@@ -54,6 +57,11 @@ jobs:
           # ke andar jhaank ke dekhta hai (ptrace se) - humari apni script
           # ke kisi bhi internal logging/diagnostic par bharosa nahi karta,
           # isliye agar wo bhi fail ho jaye, ye phir bhi kaam karega.
+          #
+          # NOTE: `sudo` ka apna alag PATH hota hai jisme pip-installed tools
+          # (jaise py-spy) nahi hote - isliye `sudo py-spy` seedha kaam nahi
+          # karta. Fix: pehle `command -v` se poora path nikal ke, wahi
+          # `sudo` ko diya jata hai.
           while kill -0 "$PY_PID" 2>/dev/null; do
             sleep 60
             if kill -0 "$PY_PID" 2>/dev/null; then
@@ -61,7 +69,7 @@ jobs:
               echo "=================================================="
               echo "=== py-spy dump at $(date -u +%H:%M:%S) UTC ==="
               echo "=================================================="
-              sudo py-spy dump --pid "$PY_PID" || echo "(py-spy dump fail ho gaya - shayad process abhi khatam hua)"
+              sudo "$PYSPY" dump --pid "$PY_PID" || echo "(py-spy dump fail ho gaya - shayad process abhi khatam hua)"
             fi
           done
 
