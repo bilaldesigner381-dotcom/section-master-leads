@@ -4,6 +4,12 @@
 # Kaam: run khatam hone ke baad workflow khud agla run trigger karta hai (kam az kam 55 min baad),
 # is liye GitHub ke cron ke skip/late hone se farq nahi padta. Cron sirf backup hai.
 # Pehli baar Actions tab se "Run workflow" dabayein, chain phir khud chalti rahegi.
+#
+# DEBUG: "Run lead finder" step ab script ko background me chalata hai aur har 60
+# second par py-spy se poore process ka LIVE thread-stack dump leta hai - taake
+# agar script kabhi "stuck" dikhe, humein seedha, guaranteed proof mile ke har
+# thread us waqt exact kis line par hai (script ke apne internal logging par
+# bharosa kiye bagair).
 
 name: Shopify Lead Finder (hourly)
 
@@ -35,10 +41,32 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 gspread google-auth dnspython
+        run: pip install requests beautifulsoup4 gspread google-auth dnspython py-spy
 
-      - name: Run lead finder
-        run: python shopify_lead_finder_v3.py
+      - name: Run lead finder (with live py-spy thread-dump monitoring)
+        run: |
+          python shopify_lead_finder_v3.py &
+          PY_PID=$!
+          echo "Script chal rahi hai, PID: $PY_PID"
+
+          # Har 60 second par, jab tak script zinda hai, uska EXACT stack
+          # (har thread, har line) print karte raho. Ye seedha OS se process
+          # ke andar jhaank ke dekhta hai (ptrace se) - humari apni script
+          # ke kisi bhi internal logging/diagnostic par bharosa nahi karta,
+          # isliye agar wo bhi fail ho jaye, ye phir bhi kaam karega.
+          while kill -0 "$PY_PID" 2>/dev/null; do
+            sleep 60
+            if kill -0 "$PY_PID" 2>/dev/null; then
+              echo ""
+              echo "=================================================="
+              echo "=== py-spy dump at $(date -u +%H:%M:%S) UTC ==="
+              echo "=================================================="
+              sudo py-spy dump --pid "$PY_PID" || echo "(py-spy dump fail ho gaya - shayad process abhi khatam hua)"
+            fi
+          done
+
+          wait "$PY_PID"
+          exit $?
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
