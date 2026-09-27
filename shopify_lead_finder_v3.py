@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3.7 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.8 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -23,6 +23,21 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
+-------------------------------------------------------------------------------
+CHANGELOG v3.8 — FIX: v3.7 ka apna side-effect — sitemap se sirf ~8,756
+apps mil rahi thin (pehle 27,227 milti thin).
+-------------------------------------------------------------------------------
+Root cause: v3.7 me `bounded_get()` ka default `max_bytes` GIL-freeze fix ke
+liye 8 MB se ghata kar 1.5 MB kiya gaya tha. `fetch_text()` — jo apps
+sitemap XML (27,000+ URLs, ~4-5 MB) download karne ke liye bhi use hoti
+hai — usi shared default ko use kar rahi thi, is liye sitemap beech me hi
+kaat diya ja raha tha aur jitna 1.5 MB me fit hua utne hi apps mil rahe the.
+
+FIX: `fetch_text()` ko apna alag, generous `max_bytes` (15 MB) diya gaya —
+ye Shopify ka apna trusted content hai (arbitrary merchant page nahi), is
+liye GIL-freeze wala khatra yahan lagoo nahi hota. Wo khatra sirf
+`collect_emails()` ki regex ke liye tha, jo v3.7 se hi alag (aur is file-size
+change se bilkul independent) `EMAIL_SCAN_MAX_CHARS` (300 KB) se capped hai.
 -------------------------------------------------------------------------------
 CHANGELOG v3.7 — CONFIRMED FIX (py-spy se pakka saboot mila): total process
 freeze, 5 lagataar py-spy dumps (4 minute) me HAR thread ki HAR line
@@ -460,9 +475,21 @@ def bounded_get(url, params=None, headers=None, hard_timeout=None, retries=1,
     return None
 
 
-def fetch_text(url, timeout=30, retries=3):
+def fetch_text(url, timeout=30, retries=3, max_bytes=15_000_000):
+    """v3.8 FIX (regression from v3.7): `fetch_text` sitemap/index XML fetch
+    karne ke liye bhi use hoti hai — Shopify ka apps sitemap 27,000+ URLs ke
+    sath ~4-5 MB ka hota hai. v3.7 me `bounded_get`'s default `max_bytes`
+    1.5 MB par le aaya tha (GIL-freeze fix ke liye, jo sirf merchant contact
+    pages ke liye zaroori tha), lekin `fetch_text` bhi wahi shared default
+    use kar rahi thi — is se sitemap BEECH ME KAAT diya ja raha tha, aur
+    27,227 ki jagah sirf ~8,756 apps discover ho rahi thin (jitna 1.5 MB me
+    fit hua utna hi). Ab `fetch_text` ka apna generous cap (15 MB) hai —
+    ye Shopify ka apna trusted content hai (arbitrary merchant page nahi),
+    is liye GIL-freeze wala khatra yahan lagoo nahi hota (wo sirf
+    `collect_emails()` ki regex ke liye tha, jo alag se 300 KB par
+    EMAIL_SCAN_MAX_CHARS se capped hai, is file size se bilkul independent)."""
     for attempt in range(retries):
-        result = bounded_get(url, hard_timeout=timeout, retries=1)
+        result = bounded_get(url, hard_timeout=timeout, retries=1, max_bytes=max_bytes)
         if result is None:
             time.sleep(1.5)
             continue
