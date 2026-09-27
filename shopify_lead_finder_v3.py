@@ -1,5 +1,5 @@
 """
-SHOPIFY LEAD FINDER v3.5 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
+SHOPIFY LEAD FINDER v3.6 — DYNAMIC APP DISCOVERY, HOURLY RUNS, EMAIL MANDATORY
 =============================================================================
 Ab koi hardcoded app list nahi hai.
 
@@ -23,6 +23,48 @@ Run har ghante khud (VPS / Render / PC par):     RUN_FOREVER=1 python shopify_le
 Install:
   pip install requests beautifulsoup4 gspread google-auth dnspython
 
+-------------------------------------------------------------------------------
+CHANGELOG v3.6 — FIX: v3.5 ke baad bhi freeze wapas aa gaya, is dafa aur
+pehle (sirf 11 names complete) — asal wajah ek structural design masla nikla,
+koi aur "ek chhota bug" nahi
+-------------------------------------------------------------------------------
+v3.1 se v3.5 tak maine chaar ALAG-ALAG real bugs pakde aur fix kiye (DNS
+hang, watchdog ka apna exit stuck hona, heartbeat ka thread-leak) — sab sahi
+thay apni jaga par, lekin freeze wapas aata raha. Wajah: in saari layered
+"safety" pools (_http_executor, _getaddrinfo_executor, _dns_executor, etc.)
+ko har baar SAFE rakhne ke chakkar me maine unki SIZE badhati rehti thi
+(100 → phir 300 threads for getaddrinfo akela) — is se total mumkin threads
+EK WAQT ME ~440+ tak pahunch gaye the:
+  MAX_WORKERS(25) + HTTP_EXECUTOR_WORKERS(100) + GETADDRINFO_POOL_SIZE(300)
+  + DNS_WORKERS(8) + APP_SCRAPE_WORKERS(4) + DISCOVERY_WORKERS(4) + housekeeping
+
+GitHub Actions ka standard Linux runner sirf kuch CPU cores deta hai. Linux
+par har thread ka DEFAULT stack size 8MB hota hai — 440 threads × 8MB =
+~3.5GB SIRF thread stacks ke liye, GIL contention aur scheduler overhead alag
+se. Itni threads is chhote runner par I/O-bound kaam ke liye bhi koi faida
+nahi deti (GIL ki wajah se ek waqt me sirf ek thread Python code chalati
+hai) — ulta itni threads banane/switch karne ka overhead khud itna bara ho
+jata hai ke poora process practically RUK jata hai, resource-thrashing me
+phas kar. Ye BILKUL "frozen" jaisa dikhta hai (koi progress, koi log, sheet
+me koi naya row nahi) lekin asal me koi single "stuck" thread nahi — poora
+system hi itna overloaded hai ke kuch bhi meaningful raftar se nahi chal
+raha, aur kabhi khud recover nahi hota jab tak GitHub apni 60-min limit par
+process mar na de.
+
+FIX: concurrency ko is chhote CI runner ke hisaab se REALISTIC banaya:
+  - MAX_WORKERS: 25 → 15
+  - HTTP_EXECUTOR_WORKERS multiplier: 4x → 2x (ab MAX_WORKERS ke sath scale
+    hota hai, 15 par 30 threads)
+  - GETADDRINFO_POOL_SIZE: 300 → 40 (flat)
+  Naya total ceiling ~106 threads (pehle ~440 se) — ek chhote CI runner ke
+  liye kaafi zyada reasonable.
+
+Bonus: `threading.stack_size(256 * 1024)` add kiya — poore process ki HAR
+naye thread ka default stack ab 256KB hai (8MB ki jaga), kyunke ye saari
+threads sirf simple I/O-bound kaam (HTTP/DNS) karti hain, deep call stack
+kabhi nahi chahiye hoti. Isse baaqi bachi hui threads ka memory footprint
+bhi ~32x kam ho gaya, jo agar phir kabhi concurrency zyada ho jaye to bhi
+ek extra safety margin deta hai.
 -------------------------------------------------------------------------------
 CHANGELOG v3.5 — FIX: v3.4 ke fix ne khud EK NAYA bug bana diya — heartbeat
 bilkul mar jati thi (koi log, koi stall-warning, kuch nahi), phir GitHub
@@ -228,6 +270,16 @@ import threading
 import faulthandler
 import requests
 
+# v3.6: har naye thread ka default stack size Linux par 8MB hota hai. Is
+# script me kaafi saari threads (worker pools) ban sakti hain, aur har thread
+# sirf simple I/O-bound kaam (HTTP request, DNS lookup) karti hai — deep call
+# stack ya bare local buffers ki zaroorat nahi. 256KB kaafi zyada hai is kaam
+# ke liye, aur 8MB se 32x kam memory pressure daalta hai jab kaafi threads
+# ek sath zinda hon. Ye poore process ke liye AGLI banne wali har thread par
+# lagu hota hai — is liye sabse pehle, kisi bhi ThreadPoolExecutor banane se
+# pehle set karna zaruri hai.
+threading.stack_size(256 * 1024)
+
 from collections import Counter, namedtuple
 from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import (
@@ -294,7 +346,7 @@ socket.setdefaulttimeout(20)
 # single patch protects every network call in the whole process at its true
 # source, including Google Sheets.
 GETADDRINFO_HARD_TIMEOUT_SECONDS = float(os.environ.get("GETADDRINFO_HARD_TIMEOUT_SECONDS", "6"))
-GETADDRINFO_POOL_SIZE = int(os.environ.get("GETADDRINFO_POOL_SIZE", "300"))
+GETADDRINFO_POOL_SIZE = int(os.environ.get("GETADDRINFO_POOL_SIZE", "40"))
 _getaddrinfo_executor = ThreadPoolExecutor(
     max_workers=GETADDRINFO_POOL_SIZE, thread_name_prefix="getaddrinfo"
 )
@@ -364,7 +416,7 @@ RUN_FOREVER = _env_bool("RUN_FOREVER", False)
 RUN_EVERY_MINUTES = float(os.environ.get("RUN_EVERY_MINUTES", "60"))
 
 # --- Analysis ---
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "15"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "100"))
 STORE_TIME_BUDGET_SECONDS = float(os.environ.get("STORE_TIME_BUDGET_SECONDS", "25"))
@@ -522,9 +574,19 @@ DEFAULT_UA = (
 # (Python threads can't be force-killed), a pool sized exactly to
 # MAX_WORKERS would eventually fill up with stuck threads and start
 # queueing new requests behind them — recreating the exact freeze we're
-# fixing. A 4x pool gives plenty of headroom for stuck threads to
-# accumulate over a run while fresh requests still get a free thread.
-HTTP_EXECUTOR_WORKERS = int(os.environ.get("HTTP_EXECUTOR_WORKERS", str(MAX_WORKERS * 4)))
+# fixing.
+#
+# v3.6: this used to be a 4x multiplier (100 threads on MAX_WORKERS=25), and
+# GETADDRINFO_POOL_SIZE used to be a flat 300 — combined with everything
+# else, the process could spin up 400+ OS threads at once. On a modest
+# GitHub Actions runner (a handful of CPU cores), that many threads (each
+# with a default 8MB stack — see threading.stack_size() above) causes real
+# memory pressure and GIL/scheduler thrashing that LOOKS exactly like a
+# total freeze (everything slows to a crawl and never recovers within any
+# reasonable window) even though no single bug is "hanging" anymore. Now
+# capped at a modest 2x, sized for a shared CI runner rather than a
+# dedicated multi-core server.
+HTTP_EXECUTOR_WORKERS = int(os.environ.get("HTTP_EXECUTOR_WORKERS", str(MAX_WORKERS * 2)))
 _http_executor = ThreadPoolExecutor(max_workers=HTTP_EXECUTOR_WORKERS, thread_name_prefix="http-fetch")
 
 
@@ -1803,7 +1865,7 @@ def run_once():
 
     logger.info("=" * 70)
     logger.info(
-        "SHOPIFY LEAD FINDER v3.5 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
+        "SHOPIFY LEAD FINDER v3.6 — dynamic apps | email mandatory | budget %s min | hard timeout %s min",
         RUN_TIME_BUDGET_MINUTES, hard_minutes
     )
     logger.info(
