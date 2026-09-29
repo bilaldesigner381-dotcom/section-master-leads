@@ -329,6 +329,15 @@ def sync_leads(leads_rows, out_ws, out_rows, unsub):
 # ============================================================
 # PERSONALIZATION
 # ============================================================
+KNOWN_THEMES = {
+    "dawn", "refresh", "craft", "sense", "taste", "studio", "ride", "origin", "crave", "publisher", "colorblock",
+    "spotlight", "horizon", "trade", "impulse", "prestige", "empire", "turbo", "broadcast", "fabric", "vantage",
+    "ritual", "symmetry", "warehouse", "focal", "expanse", "kagami", "motion", "pipeline", "enterprise", "canopy",
+    "streamline", "palo alto", "mr parker", "be yours", "fetch", "local", "retina", "reformation", "combine",
+    "blockshop", "stiletto", "wonder", "shine", "sitar", "minimog", "gain", "aurora", "ella",
+}
+
+
 def picks_for(lead):
     """(section, benefit, observation) — Leads sheet ke columns se store ke liye relevant sections."""
     g = lambda k: (lead.get(k, "") or "").strip().upper()
@@ -404,7 +413,7 @@ def build_message(lead, stage, base_subject=None):
                        f"the homepage could be doing even more for it.")
 
     theme_line = ""
-    if theme and theme.lower() != "unknown":
+    if theme.lower() in KNOWN_THEMES:   # sirf asli/mashhoor themes ka naam, "Copy of Copy of backup..." jaisa nahi
         theme_line = f" It works right inside your {theme} theme's editor."
 
     if stage == 0:
