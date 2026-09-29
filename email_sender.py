@@ -63,6 +63,9 @@ MIN_QUALITY = os.environ.get("MIN_QUALITY", "GOOD").upper()
 DRY_RUN = os.environ.get("SEND_MODE", "dry").strip().lower() != "live"
 SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
 IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
+DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "30"))   # 24 ghante me har account ki hard limit
+BOUNCE_PAUSE_RATIO = float(os.environ.get("BOUNCE_PAUSE_RATIO", "0.08"))     # bounce rate is se zyada => sending band
+BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "10"))
 
 QUALITY_RANK = {"LOW": 0, "GOOD": 1, "WARM": 2, "HOT": 3}
 
@@ -80,6 +83,63 @@ OUT_HEADERS = [
 
 FREE_PROVIDERS = {"gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
                   "live.com", "icloud.com", "aol.com", "proton.me", "protonmail.com"}
+FREE_PROVIDERS |= {
+    "qq.com", "163.com", "126.com", "sina.com", "sohu.com", "yeah.net", "foxmail.com", "gmx.com", "gmx.de",
+    "gmx.net", "web.de", "mail.com", "mail.ru", "yandex.com", "yandex.ru", "rediffmail.com", "ymail.com",
+    "rocketmail.com", "btinternet.com", "comcast.net", "verizon.net", "att.net", "sbcglobal.net",
+    "bellsouth.net", "cox.net", "shaw.ca", "rogers.com", "bigpond.com", "free.fr", "orange.fr",
+    "wanadoo.fr", "t-online.de", "libero.it", "virgilio.it", "naver.com", "daum.net",
+}
+
+
+def is_free(dom):
+    return dom in FREE_PROVIDERS or bool(re.match(r"^(yahoo|hotmail|outlook|live|gmx|msn)\.", dom))
+
+
+# --- email quality filter (junk / placeholder / file-name / glued-text addresses) ---
+GOOD_TLDS = {
+    "com", "net", "org", "info", "biz", "edu", "gov", "shop", "store", "online", "xyz", "app", "dev", "site",
+    "club", "live", "tech", "design", "art", "studio", "boutique", "fashion", "beauty", "jewelry", "jewellery",
+    "gifts", "gift", "life", "world", "today", "news", "email", "cafe", "coffee", "tea", "wine", "beer", "fit",
+    "fitness", "yoga", "health", "care", "shopping", "market", "clothing", "wear", "style", "co", "pet", "pets",
+    "home", "house", "garden", "florist", "flowers", "photo", "photography", "agency", "company", "group",
+    "services", "solutions", "media", "digital", "cloud", "website", "space", "store", "one", "bio", "eco",
+}
+BAD_TLDS_2 = {"js", "py", "md", "ts"}
+PLACEHOLDER_LOCALS = {
+    "recipient", "destinataire", "nom_utilisateur", "brugernavn", "benutzername", "usuario", "yourname",
+    "name", "email", "user", "username", "example", "test", "noreply", "no-reply", "donotreply",
+    "do-not-reply", "mailer-daemon", "postmaster", "customer", "yourmail", "youremail",
+}
+PLACEHOLDER_DOMAINS = {
+    "example", "exemple", "eksempel", "beispiel", "ejemplo", "yourstore", "yourdomain", "yoursite", "domain",
+    "email", "mysite", "mydomain", "test", "sentry", "wixpress", "shopify", "myshopify", "yourcompany",
+}
+ROLE_LOCALS = {"privacy", "dpo", "legal", "abuse", "security", "compliance", "gdpr", "careers", "jobs", "hr"}
+STRICT_EMAIL_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}@(?:[a-z0-9-]+\.)+[a-z]{2,24}$")
+
+
+def email_problem(email):
+    """Khali string = theek hai, warna wajah (junk/placeholder/glued text/role mailbox)."""
+    e = (email or "").strip().lower()
+    if not STRICT_EMAIL_RE.match(e):
+        return "invalid format"
+    local, dom = e.split("@")
+    if re.match(r"^u00[0-9a-f]{2}", local):
+        return "encoded junk"
+    tld = dom.rsplit(".", 1)[-1]
+    if tld in BAD_TLDS_2 or (len(tld) > 2 and tld not in GOOD_TLDS):
+        return f"suspicious TLD .{tld}"
+    if local in PLACEHOLDER_LOCALS:
+        return "placeholder name"
+    labels = dom.split(".")
+    if labels[0] in PLACEHOLDER_DOMAINS or (len(labels) > 1 and labels[-2] in PLACEHOLDER_DOMAINS):
+        return "placeholder domain"
+    if local in ROLE_LOCALS:
+        return "role mailbox"
+    return ""
+
+
 EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
 STOP_RE = re.compile(r"\b(stop|unsubscribe|remove me|remove us|not interested|don'?t email|do not email|opt out)\b", re.I)
 
@@ -115,6 +175,7 @@ def connect():
         sys.exit("GOOGLE_SHEET_ID secret set karein (nayi lead-finder sheet ka ID/URL).")
     gc = get_client()
     sh = gc.open_by_key(re.sub(r".*/d/([\w-]+).*", r"\1", SHEET_ID))
+    log.info("CONNECTED SHEET: '%s' -> %s", sh.title, sh.url)
 
     def tab(title, headers):
         try:
@@ -148,21 +209,41 @@ def append_in_chunks(ws, rows):
 
 
 def update_row(out_ws, r):
+    """True agar sheet me save ho gaya, warna False."""
     vals = [r["Status"], r["Stage"], r["Sender"], r["Message-ID"], r["Subject"],
             r["Last Sent"], r["Next Due"], r["Notes"]]
     for attempt in range(4):
         try:
             out_ws.update(values=[vals], range_name=f"F{r['_row']}:M{r['_row']}", value_input_option="RAW")
-            return
+            return True
         except Exception as e:
             log.warning("Row update retry %s: %s", attempt + 1, e)
             time.sleep(5 * (attempt + 1))
-    log.error("Row %s update fail hui (%s) — duplicate ka khatra, dhyan dein!", r["_row"], r["Email"])
+    log.error("Row %s update fail hui (%s).", r["_row"], r["Email"])
+    return False
+
+
+def batch_update_rows(out_ws, rows):
+    """Bahut si rows ek hi API call me (Sheets ki '60 writes/min' quota se bachne ke liye)."""
+    payload = [{"range": f"F{r['_row']}:M{r['_row']}",
+                "values": [[r["Status"], r["Stage"], r["Sender"], r["Message-ID"], r["Subject"],
+                            r["Last Sent"], r["Next Due"], r["Notes"]]]} for r in rows]
+    for i in range(0, len(payload), 300):
+        chunk = payload[i:i + 300]
+        for attempt in range(5):
+            try:
+                out_ws.batch_update(chunk, value_input_option="RAW")
+                break
+            except Exception as e:
+                log.warning("Batch update retry %s: %s", attempt + 1, e)
+                time.sleep(10 * (attempt + 1))
+        else:
+            log.error("Batch update fail (%s rows) — sending ab bhi safe hai, agli run me dobara try hoga.", len(chunk))
 
 
 def is_unsub(email, unsub):
     dom = email.split("@")[-1]
-    return email in unsub or (dom in unsub and dom not in FREE_PROVIDERS)
+    return email in unsub or (dom in unsub and not is_free(dom))
 
 
 # ============================================================
@@ -229,7 +310,10 @@ def sync_leads(leads_rows, out_ws, out_rows, unsub):
         known.add(email)
         quality = lead.get("Quality", "LOW").upper()
         status, note = "new", ""
-        if QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(MIN_QUALITY, 1):
+        bad = email_problem(email)
+        if bad:
+            status, note = "skipped", f"bad email: {bad}"
+        elif QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(MIN_QUALITY, 1):
             status, note = "skipped", f"quality {quality} < {MIN_QUALITY}"
         elif lead.get("Theme", "").strip().lower() in LEGACY_THEMES:
             status, note = "skipped", "legacy theme (no OS2.0 sections)"
@@ -410,7 +494,7 @@ def check_inbox(sender, active):
     domain_map = {}
     for e in active:
         d = e.split("@")[-1]
-        if d not in FREE_PROVIDERS:
+        if not is_free(d):
             domain_map.setdefault(d, e)
     try:
         M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
@@ -479,30 +563,63 @@ def run_once():
 
     now = utcnow()
 
-    # 1) replies / bounces / unsubscribes
+    log.info("Leads tab: %s rows | Outreach tab: %s rows", len(leads_rows), len(out_rows))
+    changed = {}
+
+    # 1) replies / bounces / unsubscribes (inbox se)
     active = {r["Email"].lower(): r for r in out_rows if r["Status"] == "active"}
     for s in senders:
         for email, kind in check_inbox(s, dict(active)):
             r = active.get(email)
             if r:
                 r["Status"], r["Notes"] = kind, f"{kind} detected {iso(now)}"
-                update_row(out_ws, r)
+                changed[r["_row"]] = r
                 log.info("%s -> %s", email, kind)
                 active.pop(email, None)
+
+    # 1b) junk / placeholder / galat addresses jo abhi 'new' ya 'active' hain -> skipped (kabhi email nahi jayegi)
+    bad_count = 0
+    for r in out_rows:
+        if r["Status"] in ("new", "active"):
+            why = email_problem(r["Email"])
+            if why:
+                r["Status"], r["Notes"], r["Next Due"] = "skipped", f"bad email: {why}", ""
+                changed[r["_row"]] = r
+                bad_count += 1
+    if bad_count:
+        log.info("%s junk/galat email addresses skip mark hue.", bad_count)
 
     # 2) manual Unsubscribed tab
     for r in out_rows:
         if r["Status"] in ("new", "active") and is_unsub(r["Email"].lower(), unsub):
             r["Status"], r["Notes"] = "unsub", "in Unsubscribed tab"
-            update_row(out_ws, r)
+            changed[r["_row"]] = r
 
-    # 3) quota (cron thora late/early ho to bhi half-run na kate)
+    if changed:
+        batch_update_rows(out_ws, list(changed.values()))
+        log.info("Sheet me %s rows ka status ek saath update hua.", len(changed))
+
+    # 3) CIRCUIT BREAKER: pichle 72 ghante ki bheji hui mails me bounce rate zyada ho to sending band
+    since72 = now - timedelta(hours=72)
+    sent72 = [r for r in out_rows if (parse_iso(r["Last Sent"]) or since72) > since72]
+    bounced72 = [r for r in sent72 if r["Status"] == "bounced"]
+    if len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO:
+        log.error("SENDING PAUSED: pichle 72h me %s me se %s bounce (%.0f%%) — limit %.0f%%. "
+                  "Pehle bounce ki wajah dekhein, phir Outreach tab me bounced rows check karein.",
+                  len(sent72), len(bounced72), 100 * len(bounced72) / len(sent72), 100 * BOUNCE_PAUSE_RATIO)
+        return
+
+    # 4) quota + hard caps (cron thora late/early ho to bhi half-run na kate)
     window_start = now - timedelta(minutes=QUOTA_WINDOW_MINUTES)
-    recent = {}
+    day_start = now - timedelta(hours=24)
+    recent, daily = {}, {}
     for r in out_rows:
-        t = parse_iso(r["Last Sent"])
-        if r["Sender"] and t and t > window_start:
-            recent[r["Sender"].lower()] = recent.get(r["Sender"].lower(), 0) + 1
+        t, sd = parse_iso(r["Last Sent"]), r["Sender"].lower()
+        if sd and t:
+            if t > window_start:
+                recent[sd] = recent.get(sd, 0) + 1
+            if t > day_start:
+                daily[sd] = daily.get(sd, 0) + 1
 
     def score(r):
         try:
@@ -512,10 +629,14 @@ def run_once():
 
     new_pool = sorted([r for r in out_rows if r["Status"] == "new"],
                       key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
+    max_per_run = PER_SENDER_PER_RUN * len(senders)   # poori run ki HARD limit
     total_sent = 0
 
     for s in senders:
-        quota = PER_SENDER_PER_RUN - recent.get(s["email"], 0)
+        if total_sent >= max_per_run:
+            break
+        quota = min(PER_SENDER_PER_RUN - recent.get(s["email"], 0),
+                    DAILY_MAX_PER_SENDER - daily.get(s["email"], 0))
         if quota <= 0:
             log.info("%s: quota pura, skip.", s["email"])
             continue
@@ -530,6 +651,8 @@ def run_once():
             batch.append(new_pool.pop(0))
 
         for n, r in enumerate(batch):
+            if total_sent >= max_per_run:
+                break
             email = r["Email"].lower()
             stage = int(r["Stage"] or 0)
             lead = lead_by_email.get(email, {"Store Name": r["Store Name"], "Domain": r["Domain"]})
@@ -540,10 +663,24 @@ def run_once():
                          s["email"], email, stage + 1, subject, body, "-" * 60)
                 continue
 
+            # PEHLE sheet me "sending" reserve karo — save na ho to email bheji hi nahi jayegi
+            # (crash/error ki soorat me ek email dobara nahi, kam az kam ek baar se zyada kabhi nahi)
+            prev_status, prev_last, prev_sender = r["Status"], r["Last Sent"], r["Sender"]
+            r["Status"], r["Last Sent"], r["Sender"] = "sending", iso(utcnow()), s["email"]
+            if not update_row(out_ws, r):
+                r["Status"], r["Last Sent"], r["Sender"] = prev_status, prev_last, prev_sender
+                log.error("Sheet me reserve save nahi hua — sending ROK di (duplicate se bachne ke liye).")
+                return
+
+            def rollback():
+                r["Status"], r["Last Sent"], r["Sender"] = prev_status, prev_last, prev_sender
+                update_row(out_ws, r)
+
             try:
                 mid = smtp_send(s, email, subject, body, in_reply_to=r["Message-ID"] if (stage > 0 and r["Message-ID"]) else None)
             except smtplib.SMTPAuthenticationError as e:
                 log.error("%s: login fail (%s) — is account ko skip kar raha hun.", s["email"], e)
+                rollback()
                 break
             except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as e:
                 r["Status"], r["Notes"] = "bounced", f"SMTP refused: {str(e)[:120]}"
@@ -551,21 +688,21 @@ def run_once():
                 continue
             except Exception as e:
                 log.error("Send fail %s -> %s: %s", s["email"], email, e)
+                rollback()
                 continue
 
             r["Stage"] = stage + 1
-            r["Sender"] = s["email"]
-            r["Last Sent"] = iso(utcnow())
             if stage == 0:
                 r["Message-ID"], r["Subject"], r["Status"] = mid, subject, "active"
                 r["Next Due"] = iso(utcnow() + timedelta(days=FU1_DAYS))
             elif stage == 1:
+                r["Status"] = "active"
                 r["Next Due"] = iso(utcnow() + timedelta(days=FU2_DAYS))
             else:
                 r["Next Due"], r["Status"] = "", "done"
             update_row(out_ws, r)
             total_sent += 1
-            log.info("SENT %s -> %s (email %s/3)", s["email"], email, stage + 1)
+            log.info("SENT %s -> %s (email %s/3) [%s/%s is run me]", s["email"], email, stage + 1, total_sent, max_per_run)
             if n < len(batch) - 1:
                 time.sleep(random.randint(*SEND_GAP))
 
