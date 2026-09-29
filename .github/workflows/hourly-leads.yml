@@ -1,92 +1,43 @@
-# Path: .github/workflows/hourly-leads.yml
-# Secrets: GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID
-#
-# Kaam: run khatam hone ke baad workflow khud agla run trigger karta hai (kam az kam 55 min baad),
-# is liye GitHub ke cron ke skip/late hone se farq nahi padta. Cron sirf backup hai.
-# Pehli baar Actions tab se "Run workflow" dabayein, chain phir khud chalti rahegi.
-#
-# DEBUG: "Run lead finder" step ab script ko background me chalata hai aur har 60
-# second par py-spy se poore process ka LIVE thread-stack dump leta hai - taake
-# agar script kabhi "stuck" dikhe, humein seedha, guaranteed proof mile ke har
-# thread us waqt exact kis line par hai (script ke apne internal logging par
-# bharosa kiye bagair).
-
-name: Shopify Lead Finder (hourly)
-
+name: Hourly Email Sender
 on:
   schedule:
-    - cron: "17 * * * *"      # backup
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  actions: write               # agla run trigger karne ke liye
+    - cron: '23 * * * *'  # har ghante 23 minute par
+  workflow_dispatch:       # manual "Run workflow" button
 
 concurrency:
-  group: lead-finder           # ek waqt me sirf ek run
+  group: email-sender      # do runs aik sath overlap na hon
   cancel-in-progress: false
 
 jobs:
-  run:
+  send-emails:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Remember start time
-        run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
+          python-version: '3.12'
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 gspread google-auth dnspython py-spy
-
-      - name: Run lead finder (with live py-spy thread-dump monitoring)
-        run: |
-          PYSPY="$(command -v py-spy)"
-          echo "py-spy path: $PYSPY"
-
-          python shopify_lead_finder_v3.py &
-          PY_PID=$!
-          echo "Script chal rahi hai, PID: $PY_PID"
-
-          # Har 60 second par, jab tak script zinda hai, uska EXACT stack
-          # (har thread, har line) print karte raho. Ye seedha OS se process
-          # ke andar jhaank ke dekhta hai (ptrace se) - humari apni script
-          # ke kisi bhi internal logging/diagnostic par bharosa nahi karta,
-          # isliye agar wo bhi fail ho jaye, ye phir bhi kaam karega.
-          #
-          # NOTE: `sudo` ka apna alag PATH hota hai jisme pip-installed tools
-          # (jaise py-spy) nahi hote - isliye `sudo py-spy` seedha kaam nahi
-          # karta. Fix: pehle `command -v` se poora path nikal ke, wahi
-          # `sudo` ko diya jata hai.
-          while kill -0 "$PY_PID" 2>/dev/null; do
-            sleep 60
-            if kill -0 "$PY_PID" 2>/dev/null; then
-              echo ""
-              echo "=================================================="
-              echo "=== py-spy dump at $(date -u +%H:%M:%S) UTC ==="
-              echo "=================================================="
-              sudo "$PYSPY" dump --pid "$PY_PID" || echo "(py-spy dump fail ho gaya - shayad process abhi khatam hua)"
-            fi
-          done
-
-          wait "$PY_PID"
-          exit $?
+        run: pip install -r requirements.txt
+      - name: Write Google token file
+        run: echo '${{ secrets.TOKEN_JSON }}' > token.json
+      - name: Run email sender script
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          RUN_TIME_BUDGET_MINUTES: "45"
-          NAMES_TARGET_PER_RUN: "2500"
-
-      - name: Wait until 55 min since start, then trigger next run
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          elapsed=$(( $(date +%s) - START_TS ))
-          wait=$(( 3300 - elapsed ))
-          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
-          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}      # NAYI lead-finder sheet
+          SEND_MODE: live                                      # 'live' = asli emails | 'dry' = sirf test
+          PHYSICAL_ADDRESS: ${{ vars.PHYSICAL_ADDRESS }}       # optional (footer)
+          GMAIL_1_ADDRESS: ${{ secrets.GMAIL_1_ADDRESS }}
+          GMAIL_1_APPPASS: ${{ secrets.GMAIL_1_APPPASS }}
+          GMAIL_2_ADDRESS: ${{ secrets.GMAIL_2_ADDRESS }}
+          GMAIL_2_APPPASS: ${{ secrets.GMAIL_2_APPPASS }}
+          GMAIL_3_ADDRESS: ${{ secrets.GMAIL_3_ADDRESS }}
+          GMAIL_3_APPPASS: ${{ secrets.GMAIL_3_APPPASS }}
+          GMAIL_4_ADDRESS: ${{ secrets.GMAIL_4_ADDRESS }}
+          GMAIL_4_APPPASS: ${{ secrets.GMAIL_4_APPPASS }}
+          GMAIL_5_ADDRESS: ${{ secrets.GMAIL_5_ADDRESS }}
+          GMAIL_5_APPPASS: ${{ secrets.GMAIL_5_APPPASS }}
+          GMAIL_6_ADDRESS: ${{ secrets.GMAIL_6_ADDRESS }}
+          GMAIL_6_APPPASS: ${{ secrets.GMAIL_6_APPPASS }}
+        run: python email_sender.py
