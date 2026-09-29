@@ -60,7 +60,8 @@ FU1_DAYS = float(os.environ.get("FOLLOWUP1_DAYS", "3"))
 FU2_DAYS = float(os.environ.get("FOLLOWUP2_DAYS", "4"))
 MIGRATED_FU_DELAY_DAYS = float(os.environ.get("MIGRATED_FU_DELAY_DAYS", "2"))
 MIN_QUALITY = os.environ.get("MIN_QUALITY", "GOOD").upper()
-DRY_RUN = os.environ.get("SEND_MODE", "dry").strip().lower() != "live"
+SEND_MODE_RAW = os.environ.get("SEND_MODE", "")
+DRY_RUN = SEND_MODE_RAW.strip().lower() not in ("live", "1", "true", "yes", "on")
 SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
 IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
 DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "30"))   # 24 ghante me har account ki hard limit
@@ -556,7 +557,7 @@ def run_once():
     senders = load_senders()
     if not senders:
         sys.exit("Koi GMAIL_n_ADDRESS / GMAIL_n_APPPASS env var nahi mila.")
-    log.info("%s Gmail accounts load hue | mode: %s", len(senders), "DRY RUN" if DRY_RUN else "LIVE")
+    log.info("%s Gmail accounts load hue | mode: %s | SEND_MODE env = %r", len(senders), "DRY RUN" if DRY_RUN else "LIVE", SEND_MODE_RAW)
 
     gc, leads_ws, out_ws, unsub_ws = connect()
     unsub = {r["Email or Domain"].lower() for r in sheet_rows(unsub_ws) if r.get("Email or Domain")}
