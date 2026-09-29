@@ -1,188 +1,578 @@
-import os
-import re
-import time
-import smtplib
-from email.mime.text import MIMEText
-import gspread
-from google.oauth2.credentials import Credentials
+"""
+SECTION MASTER — EMAIL SENDER v2 (aapke purane setup ke mutabiq)
+================================================================
+* Gmail accounts: wahi GMAIL_1_ADDRESS/GMAIL_1_APPPASS ... (1..20 tak) env vars
+* Google login: token.json (TOKEN_JSON secret) ya GOOGLE_SERVICE_ACCOUNT_JSON — jo mile
+* Leads: NAYI lead-finder sheet (GOOGLE_SHEET_ID) ka "Leads" tab (sirf padhta hai)
+* State: usi sheet ka "Outreach" tab (Status, Stage, Sender, Next Due ...)
+* Har account har run 2 emails (PER_SENDER_PER_RUN) — follow-ups pehle, phir naye leads (HOT > WARM > GOOD)
+* Har store: 1 email + 2 follow-ups (3 din baad, phir 4 din baad), same sender, same thread
+* PURANI sheet ("Section Master Leads") me jinhe "Yes (...)" mark hai, unhe dobara pehli email
+  NAHI jati — wo Outreach me stage 1 par import hote hain aur unhe sirf follow-ups milte hain
+* Reply / bounce / "unsubscribe" IMAP se detect -> us store ko dobara email nahi
 
-SHEET_NAME = "Section Master Leads"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
-EMAILS_PER_ACCOUNT_PER_RUN = 2
-
-GMAIL_ACCOUNTS = []
-for i in range(1, 7):
-    address = os.environ.get(f"GMAIL_{i}_ADDRESS")
-    app_password = os.environ.get(f"GMAIL_{i}_APPPASS")
-    if address and app_password:
-        GMAIL_ACCOUNTS.append({"address": address, "password": app_password})
-
-EMAIL_SUBJECT = "A quick idea for {store_name}'s homepage"
-
-# {feature_intro} aur {feature_bullets} ab har lead ke liye alag hongi —
-# jo unke store mein waqai missing hai wahi mention hoga, generic list nahi.
-EMAIL_TEMPLATE = """Hi {store_name} team,
-
-I came across your store while researching {niche} brands on Shopify, and noticed you're on a default theme without {feature_intro}.
-
-We built Section Master, a free Shopify app that lets you add exactly these kinds of sections without touching any code:
-
-{feature_bullets}
-
-All of these are completely free to use. You can check it out here:
-https://apps.shopify.com/section-master
-
-If you'd like a quick free demo of how it could look on your store, just reply to this email.
-
-Best regards,
-Bilal Ahmed
-Section Master Team
-
----
-If you'd prefer not to receive emails like this, just reply with "unsubscribe" and I won't reach out again.
+SEND_MODE=dry (default) : sirf log me dikhata hai, email nahi bhejta
+SEND_MODE=live          : asli emails
 """
 
+import os
+import re
+import ssl
+import sys
+import json
+import time
+import random
+import hashlib
+import smtplib
+import imaplib
+import logging
+from datetime import datetime, timedelta, timezone
+from email import message_from_bytes
+from email.message import EmailMessage
+from email.utils import make_msgid, formatdate, parseaddr, formataddr
 
-def get_sheet():
-    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    gc = gspread.authorize(creds)
-    return gc.open(SHEET_NAME).sheet1
+import gspread
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("outreach")
+
+# ============================================================
+# CONFIG
+# ============================================================
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+OLD_SHEET_NAME = os.environ.get("OLD_SHEET_NAME", "Section Master Leads").strip()
+
+LEADS_TAB = os.environ.get("GOOGLE_SHEET_NAME", "Leads")
+OUTREACH_TAB = "Outreach"
+UNSUB_TAB = "Unsubscribed"
+
+FROM_NAME = os.environ.get("FROM_NAME", "Bilal Ahmed")
+APP_NAME = "Section Master"
+APP_URL = os.environ.get("APP_URL", "https://apps.shopify.com/section-master")
+PHYSICAL_ADDRESS = os.environ.get("PHYSICAL_ADDRESS", "").strip()
+
+PER_SENDER_PER_RUN = int(os.environ.get("PER_SENDER_PER_RUN", "2"))
+QUOTA_WINDOW_MINUTES = int(os.environ.get("QUOTA_WINDOW_MINUTES", "45"))
+FU1_DAYS = float(os.environ.get("FOLLOWUP1_DAYS", "3"))
+FU2_DAYS = float(os.environ.get("FOLLOWUP2_DAYS", "4"))
+MIGRATED_FU_DELAY_DAYS = float(os.environ.get("MIGRATED_FU_DELAY_DAYS", "2"))
+MIN_QUALITY = os.environ.get("MIN_QUALITY", "GOOD").upper()
+DRY_RUN = os.environ.get("SEND_MODE", "dry").strip().lower() != "live"
+SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
+IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
+
+QUALITY_RANK = {"LOW": 0, "GOOD": 1, "WARM": 2, "HOT": 3}
+
+# Purani (non Online Store 2.0) themes — inme app sections nahi chalte, isliye skip
+LEGACY_THEMES = {
+    "debut", "brooklyn", "minimal", "supply", "venture", "simple", "narrative",
+    "boundless", "express", "pop", "jumpstart", "fashionopolism", "vintage",
+}
+
+OUT_HEADERS = [
+    "Email", "Store Name", "Domain", "Quality", "Lead Score",   # A-E
+    "Status", "Stage", "Sender", "Message-ID", "Subject",       # F-J
+    "Last Sent", "Next Due", "Notes",                           # K-M
+]
+
+FREE_PROVIDERS = {"gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
+                  "live.com", "icloud.com", "aol.com", "proton.me", "protonmail.com"}
+EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
+STOP_RE = re.compile(r"\b(stop|unsubscribe|remove me|remove us|not interested|don'?t email|do not email|opt out)\b", re.I)
 
 
-def get_store_name(url):
-    name = re.sub(r'https?://(www\.)?', '', url)
-    name = name.split('/')[0].split('.')[0]
-    return name.replace('-', ' ').title()
+def utcnow():
+    return datetime.now(timezone.utc)
 
 
-def build_personalization(missing_features_str):
-    """Sheet ke 'Missing Features' column (comma-separated) se
-    personalized intro line aur bullet list banata hai."""
-    features = [f.strip() for f in missing_features_str.split(",") if f.strip()]
-
-    if not features:
-        # Purani rows ya data na hone ki surat mein reasonable fallback
-        features = ["an FAQ section", "customer testimonials", "a sticky add-to-cart bar"]
-
-    features = features[:4]  # email zyada lamba na ho, top 4 tak rakho
-
-    if len(features) == 1:
-        feature_intro = features[0]
-    elif len(features) == 2:
-        feature_intro = f"{features[0]} or {features[1]}"
-    else:
-        feature_intro = ", ".join(features[:-1]) + f", or {features[-1]}"
-
-    feature_bullets = "\n".join(f"- {feat[0].upper() + feat[1:]}" for feat in features)
-
-    return feature_intro, feature_bullets
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def send_email(account, to_email, store_name, niche, feature_intro, feature_bullets):
-    subject = EMAIL_SUBJECT.format(store_name=store_name)
-    body = EMAIL_TEMPLATE.format(
-        store_name=store_name, niche=niche,
-        feature_intro=feature_intro, feature_bullets=feature_bullets,
-    )
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = account["address"]
-    msg["To"] = to_email
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(account["address"], account["password"])
-        server.sendmail(account["address"], [to_email], msg.as_string())
+def parse_iso(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
-def run_once():
-    if not GMAIL_ACCOUNTS:
-        print("⚠️  Koi Gmail account configure nahi hua (environment variables missing). Rokte hain.")
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+def get_client():
+    if SA_JSON:
+        from google.oauth2.service_account import Credentials as SACreds
+        return gspread.authorize(SACreds.from_service_account_info(json.loads(SA_JSON), scopes=SCOPES))
+    from google.oauth2.credentials import Credentials as UserCreds
+    return gspread.authorize(UserCreds.from_authorized_user_file("token.json", SCOPES))
+
+
+def connect():
+    if not SHEET_ID:
+        sys.exit("GOOGLE_SHEET_ID secret set karein (nayi lead-finder sheet ka ID/URL).")
+    gc = get_client()
+    sh = gc.open_by_key(re.sub(r".*/d/([\w-]+).*", r"\1", SHEET_ID))
+
+    def tab(title, headers):
+        try:
+            return sh.worksheet(title)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+            ws.update(values=[headers], range_name="A1")
+            ws.freeze(rows=1)
+            return ws
+
+    return gc, sh.worksheet(LEADS_TAB), tab(OUTREACH_TAB, OUT_HEADERS), tab(UNSUB_TAB, ["Email or Domain"])
+
+
+def sheet_rows(ws):
+    values = ws.get_all_values()
+    if not values:
+        return []
+    head = values[0]
+    out = []
+    for i, row in enumerate(values[1:], start=2):
+        row = row + [""] * (len(head) - len(row))
+        d = {h: row[j].strip() for j, h in enumerate(head) if h}
+        d["_row"] = i
+        out.append(d)
+    return out
+
+
+def append_in_chunks(ws, rows):
+    for i in range(0, len(rows), 1000):
+        ws.append_rows(rows[i:i + 1000], value_input_option="RAW")
+
+
+def update_row(out_ws, r):
+    vals = [r["Status"], r["Stage"], r["Sender"], r["Message-ID"], r["Subject"],
+            r["Last Sent"], r["Next Due"], r["Notes"]]
+    for attempt in range(4):
+        try:
+            out_ws.update(values=[vals], range_name=f"F{r['_row']}:M{r['_row']}", value_input_option="RAW")
+            return
+        except Exception as e:
+            log.warning("Row update retry %s: %s", attempt + 1, e)
+            time.sleep(5 * (attempt + 1))
+    log.error("Row %s update fail hui (%s) — duplicate ka khatra, dhyan dein!", r["_row"], r["Email"])
+
+
+def is_unsub(email, unsub):
+    dom = email.split("@")[-1]
+    return email in unsub or (dom in unsub and dom not in FREE_PROVIDERS)
+
+
+# ============================================================
+# PURANI SHEET SE MIGRATION (already emailed -> follow-ups only)
+# ============================================================
+def store_name_from_url(url):
+    name = re.sub(r"https?://(www\.)?", "", url).split("/")[0].split(".")[0]
+    return name.replace("-", " ").title()
+
+
+def migrate_old_sheet(gc, out_ws, out_rows, senders, unsub):
+    if not OLD_SHEET_NAME or OLD_SHEET_NAME.lower() == "none":
+        return
+    if any(r["Notes"].startswith("migrated") for r in out_rows):
+        return  # pehle ho chuka
+    try:
+        old = gc.open(OLD_SHEET_NAME).sheet1.get_all_values()
+    except Exception as e:
+        log.warning("Purani sheet '%s' khul nahi saki (%s) — migration skip.", OLD_SHEET_NAME, e)
+        return
+    if not old:
+        return
+    head = old[0]
+    try:
+        i_email, i_sent, i_url = head.index("Email"), head.index("Emailed"), head.index("Store URL")
+    except ValueError:
+        log.warning("Purani sheet me Email/Emailed/Store URL columns nahi mile — migration skip.")
         return
 
-    print(f"📧 {len(GMAIL_ACCOUNTS)} Gmail accounts load hue.")
+    known = {r["Email"].lower() for r in out_rows}
+    sender_emails = [s["email"] for s in senders]
+    due = iso(utcnow() + timedelta(days=MIGRATED_FU_DELAY_DAYS))
+    rows = []
+    for row in old[1:]:
+        row = row + [""] * (len(head) - len(row))
+        email, sent, url = row[i_email].strip().lower(), row[i_sent].strip(), row[i_url].strip()
+        if not sent.lower().startswith("yes") or "@" not in email or email in known:
+            continue
+        known.add(email)
+        m = re.search(r"\(([^)]+)\)", sent)
+        sender = (m.group(1).lower() if m else "")
+        if sender not in sender_emails:
+            sender = sender_emails[0]
+        store = store_name_from_url(url)
+        domain = re.sub(r"https?://(www\.)?", "", url).split("/")[0].lower()
+        status = "unsub" if is_unsub(email, unsub) else "active"
+        rows.append([email, store, domain, "", "0", status, 1, sender, "",
+                     f"A quick idea for {store}'s homepage", "", due if status == "active" else "",
+                     "migrated from old sheet"])
+    append_in_chunks(out_ws, rows)
+    log.info("Purani sheet se %s already-emailed stores import hue (ab sirf follow-ups jayenge).", len(rows))
 
-    sheet = get_sheet()
-    all_rows = sheet.get_all_values()
-    header = all_rows[0]
 
-    if "Emailed" not in header:
-        sheet.update_cell(1, len(header) + 1, "Emailed")
-        header.append("Emailed")
+# ============================================================
+# LEADS -> OUTREACH SYNC
+# ============================================================
+def sync_leads(leads_rows, out_ws, out_rows, unsub):
+    known = {r["Email"].lower() for r in out_rows}
+    new_rows = []
+    for lead in leads_rows:
+        email = lead.get("Email", "").lower()
+        if not email or "@" not in email or email in known:
+            continue
+        known.add(email)
+        quality = lead.get("Quality", "LOW").upper()
+        status, note = "new", ""
+        if QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(MIN_QUALITY, 1):
+            status, note = "skipped", f"quality {quality} < {MIN_QUALITY}"
+        elif lead.get("Theme", "").strip().lower() in LEGACY_THEMES:
+            status, note = "skipped", "legacy theme (no OS2.0 sections)"
+        elif is_unsub(email, unsub):
+            status, note = "unsub", "in Unsubscribed tab"
+        new_rows.append([email, lead.get("Store Name", ""), lead.get("Domain", ""), quality,
+                         lead.get("Lead Score", "0"), status, 0, "", "", "", "", "", note])
+    append_in_chunks(out_ws, new_rows)
+    if new_rows:
+        log.info("Outreach tab me %s naye leads add hue.", len(new_rows))
 
-    emailed_col_index = header.index("Emailed") + 1
-    email_col_index = header.index("Email")
-    niche_col_index = header.index("Niche")
-    url_col_index = header.index("Store URL")
-    # "Missing Features" column purani sheets mein nahi hogi — gracefully handle karo
-    missing_features_col_index = header.index("Missing Features") if "Missing Features" in header else None
 
-    target_len = len(header)
-    for row in all_rows[1:]:
-        while len(row) < target_len:
-            row.append("")
+# ============================================================
+# PERSONALIZATION
+# ============================================================
+def picks_for(lead):
+    """(section, benefit, observation) — Leads sheet ke columns se store ke liye relevant sections."""
+    g = lambda k: (lead.get(k, "") or "").strip().upper()
+    recs = (lead.get("Recommended Sections", "") or "").lower()
+    try:
+        products = int(lead.get("Products", "0") or 0)
+    except ValueError:
+        products = 0
+    picks = []
+    if g("Testimonials") == "NO":
+        picks.append(("Testimonials", "build trust with customer quotes right on the homepage", "a testimonials section"))
+    if g("FAQ") == "NO":
+        picks.append(("FAQ Accordion", "answer shipping and returns questions before they become support tickets", "an FAQ section"))
+    if g("Newsletter") == "NO":
+        picks.append(("Newsletter Signup", "capture emails from visitors who aren't ready to buy yet", "a newsletter signup"))
+    if "countdown" in recs:
+        picks.append(("Announcement Countdown", "add urgency to sales and launches", "a countdown/announcement bar"))
+    if "instagram" in recs:
+        picks.append(("Instagram Feed", "show real social proof and fresh content", "an Instagram feed"))
+    if products >= 10:
+        picks.append(("Featured Collection", "push your best sellers above the fold", ""))
+    for f in [
+        ("Hero Banner Slider", "rotate your best offers in the hero area", ""),
+        ("Promo Banner", "highlight a current offer without touching code", ""),
+        ("Featured Product Premium", "give a hero product a proper showcase", ""),
+    ]:
+        if len(picks) >= 3:
+            break
+        picks.append(f)
+    return picks[:3]
 
-    already_emailed_addresses = set()
-    for row in all_rows[1:]:
-        row_email = row[email_col_index] if len(row) > email_col_index else ""
-        row_status = row[emailed_col_index - 1] if len(row) >= emailed_col_index else ""
-        if row_email and row_status.startswith("Yes"):
-            already_emailed_addresses.add(row_email.lower())
 
-    sent_count = 0
+def join_or(items):
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " or " + items[-1]
 
-    for account in GMAIL_ACCOUNTS:
-        sent_for_this_account = 0
-        attempts_for_this_account = 0
-        max_attempts_per_account = EMAILS_PER_ACCOUNT_PER_RUN + 2
 
-        for row_num, row in enumerate(all_rows[1:], start=2):
-            if sent_for_this_account >= EMAILS_PER_ACCOUNT_PER_RUN:
-                break
-            if attempts_for_this_account >= max_attempts_per_account:
-                print(f"   ⚠️  {account['address']} ke liye zyada fails ho gaye, is account ko skip kar rahe hain")
-                break
+def join_and(items):
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
-            email = row[email_col_index] if len(row) > email_col_index else ""
 
-            if not email or email == "Nahi mila" or email.startswith("Facebook"):
+def pick_variant(seed, options):
+    return options[int(hashlib.md5(seed.encode()).hexdigest(), 16) % len(options)]
+
+
+def build_message(lead, stage, base_subject=None):
+    """stage 0 = pehli email, 1/2 = follow-ups. Return (subject, body)."""
+    store = (lead.get("Store Name") or "").strip() or "your store"
+    domain = lead.get("Domain", "")
+    theme = (lead.get("Theme") or "").strip()
+    picks = picks_for(lead)
+    names = [p[0] for p in picks]
+    missing = [p[2] for p in picks if p[2]][:2]
+    first = picks[0]
+    extras = [x for x in ("Hero Banner Slider", "Logo Carousel", "Contact Form", "Promo Banner") if x not in names][:3]
+
+    subject0 = pick_variant(domain or store, [
+        f"A quick idea for {store}'s homepage",
+        f"{store}: homepage sections without a developer",
+        f"Idea for {store}",
+    ])
+
+    if missing:
+        observation = (f"I came across {store} ({domain}) on Shopify and couldn't spot "
+                       f"{join_or(missing)} on the pages I checked.")
+    else:
+        observation = (f"I came across {store} ({domain}) on Shopify, and the catalog looks great — "
+                       f"the homepage could be doing even more for it.")
+
+    theme_line = ""
+    if theme and theme.lower() != "unknown":
+        theme_line = f" It works right inside your {theme} theme's editor."
+
+    if stage == 0:
+        subject = subject0
+        body = (
+            f"Hi {store} team,\n\n"
+            f"{observation}\n\n"
+            f"We built {APP_NAME}, a free Shopify app that lets you add sections without touching any code — "
+            f"{join_and(names)}, plus {join_and(extras)} and more.{theme_line}\n\n"
+            f"You can check it out here:\n{APP_URL}\n\n"
+            f"If you'd like a quick free demo of how {names[0]} could look on {store}, just reply to this email.\n\n"
+            f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
+        )
+    else:
+        base = base_subject or subject0
+        subject = "Re: " + re.sub(r"^(re:\s*)+", "", base, flags=re.I)
+        if stage == 1:
+            body = (
+                f"Hi {store} team,\n\n"
+                f"Just floating this back up in case it got buried. One example: {first[0]} lets you "
+                f"{first[1]} — set up in a couple of minutes from the theme editor, and the app is free.\n\n"
+                f"Happy to send a quick demo for {store} if useful: {APP_URL}\n\n"
+                f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
+            )
+        else:
+            body = (
+                f"Hi {store} team,\n\n"
+                f"Last note from me — I don't want to clutter your inbox. If polishing {store}'s homepage "
+                f"is on your list, {APP_NAME} is here whenever you need it: {APP_URL}\n\n"
+                f"If it's not a fit, no worries at all.\n\n"
+                f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
+            )
+
+    footer = '\n\n---\nIf you\'d prefer not to receive emails like this, just reply with "unsubscribe" and I won\'t reach out again.'
+    if PHYSICAL_ADDRESS:
+        footer += f"\n{PHYSICAL_ADDRESS}"
+    return subject, body + footer
+
+
+# ============================================================
+# SMTP / IMAP
+# ============================================================
+def load_senders():
+    senders = []
+    for i in range(1, 21):
+        addr = os.environ.get(f"GMAIL_{i}_ADDRESS", "").strip()
+        pw = os.environ.get(f"GMAIL_{i}_APPPASS", "").strip()
+        if addr and pw:
+            senders.append({"email": addr.lower(), "password": pw, "name": FROM_NAME})
+    return senders
+
+
+def smtp_send(sender, to_email, subject, body, in_reply_to=None):
+    msg = EmailMessage()
+    msg["From"] = formataddr((sender["name"], sender["email"]))
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=False)
+    mid = make_msgid(domain=sender["email"].split("@")[1])
+    msg["Message-ID"] = mid
+    msg["List-Unsubscribe"] = f"<mailto:{sender['email']}?subject=unsubscribe>"
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as server:
+        server.login(sender["email"], sender["password"])
+        server.send_message(msg)
+    return mid
+
+
+def text_of(msg):
+    try:
+        for p in (msg.walk() if msg.is_multipart() else [msg]):
+            if p.get_content_type() == "text/plain":
+                payload = p.get_payload(decode=True)
+                if payload:
+                    return payload.decode(p.get_content_charset() or "utf-8", errors="replace")
+    except Exception:
+        pass
+    return ""
+
+
+def check_inbox(sender, active):
+    """active: {email: row}. Returns [(email, 'replied'|'unsub'|'bounced')]. Headers bulk me, body sirf match par."""
+    events = []
+    domain_map = {}
+    for e in active:
+        d = e.split("@")[-1]
+        if d not in FREE_PROVIDERS:
+            domain_map.setdefault(d, e)
+    try:
+        M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
+        M.login(sender["email"], sender["password"])
+        M.select("INBOX", readonly=True)
+        since = (utcnow() - timedelta(days=IMAP_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+        _, data = M.search(None, "SINCE", since)
+        ids = data[0].split()
+
+        candidates = []  # (imap_id, matched_email or None(bounce))
+        for i in range(0, len(ids), 300):
+            _, resp = M.fetch(b",".join(ids[i:i + 300]), "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+            for item in resp:
+                if not isinstance(item, tuple):
+                    continue
+                mid = item[0].split()[0]
+                from_addr = parseaddr(message_from_bytes(item[1]).get("From", ""))[1].lower()
+                if from_addr == sender["email"]:
+                    continue
+                if re.match(r"(mailer-daemon|postmaster)@", from_addr):
+                    candidates.append((mid, None))
+                elif from_addr in active:
+                    candidates.append((mid, from_addr))
+                elif from_addr.split("@")[-1] in domain_map:
+                    candidates.append((mid, domain_map[from_addr.split("@")[-1]]))
+
+        for mid, matched in candidates[:300]:
+            _, fetched = M.fetch(mid, "(BODY.PEEK[]<0.9000>)")
+            raw = next((x[1] for x in fetched if isinstance(x, tuple)), None)
+            if not raw:
                 continue
-            if re.match(r'^x+@x+\.x+$', email.lower()):
+            body = text_of(message_from_bytes(raw))
+            if matched is None:  # bounce
+                blob = body + " " + raw.decode("utf-8", errors="ignore")
+                for e in set(x.lower() for x in EMAIL_RE.findall(blob)):
+                    if e in active:
+                        events.append((e, "bounced"))
+            else:
+                events.append((matched, "unsub" if STOP_RE.search(body.strip()[:300]) else "replied"))
+        M.logout()
+    except Exception as e:
+        log.warning("IMAP check fail (%s): %s", sender["email"], e)
+    return events
+
+
+# ============================================================
+# ONE RUN
+# ============================================================
+def run_once():
+    senders = load_senders()
+    if not senders:
+        sys.exit("Koi GMAIL_n_ADDRESS / GMAIL_n_APPPASS env var nahi mila.")
+    log.info("%s Gmail accounts load hue | mode: %s", len(senders), "DRY RUN" if DRY_RUN else "LIVE")
+
+    gc, leads_ws, out_ws, unsub_ws = connect()
+    unsub = {r["Email or Domain"].lower() for r in sheet_rows(unsub_ws) if r.get("Email or Domain")}
+
+    out_rows = sheet_rows(out_ws)
+    migrate_old_sheet(gc, out_ws, out_rows, senders, unsub)
+    out_rows = sheet_rows(out_ws)
+
+    leads_rows = sheet_rows(leads_ws)
+    sync_leads(leads_rows, out_ws, out_rows, unsub)
+    out_rows = sheet_rows(out_ws)
+    lead_by_email = {l["Email"].lower(): l for l in leads_rows if l.get("Email")}
+
+    now = utcnow()
+
+    # 1) replies / bounces / unsubscribes
+    active = {r["Email"].lower(): r for r in out_rows if r["Status"] == "active"}
+    for s in senders:
+        for email, kind in check_inbox(s, dict(active)):
+            r = active.get(email)
+            if r:
+                r["Status"], r["Notes"] = kind, f"{kind} detected {iso(now)}"
+                update_row(out_ws, r)
+                log.info("%s -> %s", email, kind)
+                active.pop(email, None)
+
+    # 2) manual Unsubscribed tab
+    for r in out_rows:
+        if r["Status"] in ("new", "active") and is_unsub(r["Email"].lower(), unsub):
+            r["Status"], r["Notes"] = "unsub", "in Unsubscribed tab"
+            update_row(out_ws, r)
+
+    # 3) quota (cron thora late/early ho to bhi half-run na kate)
+    window_start = now - timedelta(minutes=QUOTA_WINDOW_MINUTES)
+    recent = {}
+    for r in out_rows:
+        t = parse_iso(r["Last Sent"])
+        if r["Sender"] and t and t > window_start:
+            recent[r["Sender"].lower()] = recent.get(r["Sender"].lower(), 0) + 1
+
+    def score(r):
+        try:
+            return int(r["Lead Score"] or 0)
+        except ValueError:
+            return 0
+
+    new_pool = sorted([r for r in out_rows if r["Status"] == "new"],
+                      key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
+    total_sent = 0
+
+    for s in senders:
+        quota = PER_SENDER_PER_RUN - recent.get(s["email"], 0)
+        if quota <= 0:
+            log.info("%s: quota pura, skip.", s["email"])
+            continue
+
+        due = sorted(
+            [r for r in out_rows if r["Status"] == "active" and r["Sender"].lower() == s["email"]
+             and r["Stage"] in ("1", "2") and (parse_iso(r["Next Due"]) or now) <= now],
+            key=lambda r: r["Next Due"],
+        )
+        batch = due[:quota]
+        while len(batch) < quota and new_pool:
+            batch.append(new_pool.pop(0))
+
+        for n, r in enumerate(batch):
+            email = r["Email"].lower()
+            stage = int(r["Stage"] or 0)
+            lead = lead_by_email.get(email, {"Store Name": r["Store Name"], "Domain": r["Domain"]})
+            subject, body = build_message(lead, stage, base_subject=r["Subject"] or None)
+
+            if DRY_RUN:
+                log.info("[DRY RUN] %s -> %s (email %s/3)\nSubject: %s\n%s\n%s",
+                         s["email"], email, stage + 1, subject, body, "-" * 60)
                 continue
-            if email.lower() in already_emailed_addresses:
-                continue
-
-            store_url = row[url_col_index]
-            niche = row[niche_col_index] if len(row) > niche_col_index else "e-commerce"
-            store_name = get_store_name(store_url)
-
-            missing_features_str = ""
-            if missing_features_col_index is not None and len(row) > missing_features_col_index:
-                missing_features_str = row[missing_features_col_index]
-
-            feature_intro, feature_bullets = build_personalization(missing_features_str)
-
-            attempts_for_this_account += 1
 
             try:
-                send_email(account, email, store_name, niche, feature_intro, feature_bullets)
-                sheet.update_cell(row_num, emailed_col_index, f"Yes ({account['address']})")
-                row[emailed_col_index - 1] = f"Yes ({account['address']})"
-                already_emailed_addresses.add(email.lower())
-                print(f"   ✅ Email sent to {email} from {account['address']} (personalized: {feature_intro})")
-                sent_for_this_account += 1
-                sent_count += 1
-                time.sleep(5)
-            except smtplib.SMTPAuthenticationError:
-                print(f"   ❌ {account['address']} ka login fail ho gaya (credentials galat hain), is account ko skip kar rahe hain")
+                mid = smtp_send(s, email, subject, body, in_reply_to=r["Message-ID"] if (stage > 0 and r["Message-ID"]) else None)
+            except smtplib.SMTPAuthenticationError as e:
+                log.error("%s: login fail (%s) — is account ko skip kar raha hun.", s["email"], e)
                 break
+            except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as e:
+                r["Status"], r["Notes"] = "bounced", f"SMTP refused: {str(e)[:120]}"
+                update_row(out_ws, r)
+                continue
             except Exception as e:
-                print(f"   ❌ Failed to send to {email}: {e}")
-                sheet.update_cell(row_num, emailed_col_index, f"Failed: {e}")
-                row[emailed_col_index - 1] = f"Failed: {e}"
+                log.error("Send fail %s -> %s: %s", s["email"], email, e)
+                continue
 
-    print(f"\n===== DONE ===== Total {sent_count} emails is run mein send hui.")
+            r["Stage"] = stage + 1
+            r["Sender"] = s["email"]
+            r["Last Sent"] = iso(utcnow())
+            if stage == 0:
+                r["Message-ID"], r["Subject"], r["Status"] = mid, subject, "active"
+                r["Next Due"] = iso(utcnow() + timedelta(days=FU1_DAYS))
+            elif stage == 1:
+                r["Next Due"] = iso(utcnow() + timedelta(days=FU2_DAYS))
+            else:
+                r["Next Due"], r["Status"] = "", "done"
+            update_row(out_ws, r)
+            total_sent += 1
+            log.info("SENT %s -> %s (email %s/3)", s["email"], email, stage + 1)
+            if n < len(batch) - 1:
+                time.sleep(random.randint(*SEND_GAP))
+
+    counts = {}
+    for r in out_rows:
+        counts[r["Status"]] = counts.get(r["Status"], 0) + 1
+    log.info("===== DONE ===== is run me bheji: %s | status summary: %s", total_sent, counts)
 
 
 if __name__ == "__main__":
