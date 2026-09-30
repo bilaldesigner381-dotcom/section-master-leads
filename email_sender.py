@@ -65,8 +65,9 @@ DRY_RUN = SEND_MODE_RAW.strip().lower() not in ("live", "1", "true", "yes", "on"
 SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
 IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
 DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "30"))   # 24 ghante me har account ki hard limit
-BOUNCE_PAUSE_RATIO = float(os.environ.get("BOUNCE_PAUSE_RATIO", "0.08"))     # bounce rate is se zyada => sending band
-BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "10"))
+BOUNCE_PAUSE_RATIO = float(os.environ.get("BOUNCE_PAUSE_RATIO", "0.06"))     # bounce rate is se zyada => sending band
+BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "40"))           # itni mails ke baad hi rate par faisla
+BOUNCE_MIN_COUNT = int(os.environ.get("BOUNCE_MIN_COUNT", "3"))              # aur kam az kam itne bounce
 
 QUALITY_RANK = {"LOW": 0, "GOOD": 1, "WARM": 2, "HOT": 3}
 
@@ -974,7 +975,8 @@ def run_once():
     since72 = now - timedelta(hours=72)
     sent72 = [r for r in out_rows if (parse_iso(r["Last Sent"]) or since72) > since72]
     bounced72 = [r for r in sent72 if r["Status"] == "bounced"]
-    paused = len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO
+    paused = (len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) >= BOUNCE_MIN_COUNT
+              and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO)
     if paused:
         log.error("SENDING PAUSED: pichle 72h me %s me se %s bounce (%.0f%%) — limit %.0f%%. "
                   "Pehle bounce ki wajah dekhein, phir Outreach tab me bounced rows check karein.",
