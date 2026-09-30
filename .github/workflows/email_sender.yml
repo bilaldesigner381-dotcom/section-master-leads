@@ -1,33 +1,54 @@
+# Path: .github/workflows/email_sender.yml
+# Secrets: GOOGLE_SHEET_ID, TOKEN_JSON, GMAIL_1..6_ADDRESS, GMAIL_1..6_APPPASS
+#
+# Har run ke baad workflow khud agla run trigger karta hai (57 minute baad) — bilkul lead finder ki tarah,
+# isliye GitHub ke cron ke late/skip hone se farq nahi padta. Cron sirf backup hai.
+# Pehli baar Actions tab se "Run workflow" dabayein, chain phir khud chalti rahegi.
+# Rokne ke liye: Google Sheet ke "Control" tab me SEND_MODE = stop (chain chalti rahegi par emails nahi jayengi).
+# Chain poori band karni ho: Actions -> is workflow ko Disable karein.
+
 name: Hourly Email Sender
+
 on:
   schedule:
-    - cron: '23,53 * * * *'  # har ghante 2 baar (23 aur 53 minute par)
-  workflow_dispatch:       # manual "Run workflow" button
+    - cron: '23 * * * *'   # backup
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write           # agla run trigger karne ke liye
 
 concurrency:
-  group: email-sender      # do runs aik sath overlap na hon
+  group: email-sender      # ek waqt me sirf ek run
   cancel-in-progress: false
 
 jobs:
   send-emails:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     steps:
+      - name: Remember start time
+        run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Write Google token file
         run: echo '${{ secrets.TOKEN_JSON }}' > token.json
+
       - name: Run email sender script
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}      # NAYI lead-finder sheet
-          SEND_MODE: live                                      # 'live' = asli emails | 'dry' = sirf test
-          PHYSICAL_ADDRESS: ${{ vars.PHYSICAL_ADDRESS }}       # optional (footer)
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SEND_MODE: live
+          PHYSICAL_ADDRESS: ${{ vars.PHYSICAL_ADDRESS }}
           GMAIL_1_ADDRESS: ${{ secrets.GMAIL_1_ADDRESS }}
           GMAIL_1_APPPASS: ${{ secrets.GMAIL_1_APPPASS }}
           GMAIL_2_ADDRESS: ${{ secrets.GMAIL_2_ADDRESS }}
@@ -41,3 +62,13 @@ jobs:
           GMAIL_6_ADDRESS: ${{ secrets.GMAIL_6_ADDRESS }}
           GMAIL_6_APPPASS: ${{ secrets.GMAIL_6_APPPASS }}
         run: python email_sender.py
+
+      - name: Wait until 57 min since start, then trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          elapsed=$(( $(date +%s) - START_TS ))
+          wait=$(( 3420 - elapsed ))
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
