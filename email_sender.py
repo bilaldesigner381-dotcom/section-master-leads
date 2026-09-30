@@ -64,7 +64,7 @@ SEND_MODE_RAW = os.environ.get("SEND_MODE", "")
 DRY_RUN = SEND_MODE_RAW.strip().lower() not in ("live", "1", "true", "yes", "on")
 SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
 IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
-DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "30"))   # 24 ghante me har account ki hard limit
+DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "48"))   # 24 ghante me har account ki hard limit
 BOUNCE_PAUSE_RATIO = float(os.environ.get("BOUNCE_PAUSE_RATIO", "0.06"))     # bounce rate is se zyada => sending band
 BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "40"))           # itni mails ke baad hi rate par faisla
 BOUNCE_MIN_COUNT = int(os.environ.get("BOUNCE_MIN_COUNT", "3"))              # aur kam az kam itne bounce
@@ -777,7 +777,7 @@ def apply_clicks(clicks_ws, out_rows):
 # ============================================================
 # DASHBOARD + REPLIES TAB
 # ============================================================
-def write_dashboard(ws, senders, sent24, now):
+def write_dashboard(ws, senders, sent24, now, waiting=0, per_day=0):
     O = OUTREACH_TAB
     rows = [
         ["SECTION MASTER — OUTREACH DASHBOARD", ""],
@@ -800,7 +800,9 @@ def write_dashboard(ws, senders, sent24, now):
         ["Stores that clicked the link", f'=COUNTIF({O}!W2:W,">0")'],                # 18
         ["Click rate", "=IFERROR(B18/B6,0)"],                                        # 19
         ["Total clicks", f"=SUM({O}!W2:W)"],                                         # 20
-        ["", ""],                                                                    # 21
+        ["Max sending speed (emails/day, all accounts)", per_day],                   # 21
+        ["Estimated days to email all waiting leads", round(waiting / per_day) if per_day else "-"],  # 22
+        ["", ""],
         ["BY SENDER", "Stores emailed", "Replies", "Reply rate", "Bounced"],         # 22
     ]
     pct_cells = ["B13", "B17", "B19"]
@@ -853,30 +855,50 @@ def write_replies_tab(ws, rows):
 LIVE_VALUES = ("live", "1", "true", "yes", "on")
 
 
+def order_pool(pool, priority, score):
+    """Naye leads kis tarteeb se bheje jayen. score = best leads pehle | random | newest | oldest."""
+    if priority == "random":
+        pool = list(pool)
+        random.shuffle(pool)
+        return pool
+    if priority == "newest":
+        return sorted(pool, key=lambda r: -r["_row"])
+    if priority == "oldest":
+        return sorted(pool, key=lambda r: r["_row"])
+    return sorted(pool, key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
+
+
 def read_settings(control_ws):
-    """Control tab: 'Setting | Value' rows -> dict. Missing rows automatically add hoti hain."""
-    settings = {}
+    """Control tab: 'Setting | Value' rows -> dict. Missing settings khud add ho jati hain (default value ke sath)."""
+    settings, has_note = {}, False
     for row in control_ws.get_all_values()[1:]:
         if row and row[0].strip():
             settings[row[0].strip().upper()] = (row[1] if len(row) > 1 else "").strip()
+            has_note = has_note or row[0].strip().lower() == "(note)"
+    defaults = [
+        ("SEND_MODE", "dry" if DRY_RUN else "live"),
+        ("TRACK_URL", ""),
+        ("PER_SENDER_PER_RUN", str(PER_SENDER_PER_RUN)),
+        ("DAILY_MAX_PER_SENDER", str(DAILY_MAX_PER_SENDER)),
+        ("PRIORITY", "score"),
+    ]
     added = False
-    if "SEND_MODE" not in settings:
-        settings["SEND_MODE"] = "dry" if DRY_RUN else "live"
-        control_ws.append_row(["SEND_MODE", settings["SEND_MODE"]], value_input_option="RAW")
-        added = True
-    if "TRACK_URL" not in settings:
-        settings["TRACK_URL"] = ""
-        control_ws.append_row(["TRACK_URL", ""], value_input_option="RAW")
-        added = True
-    if added:
-        control_ws.append_row(["(note)", "SEND_MODE: live = bhejo | dry = sirf preview | stop = band.  "
-                                         "TRACK_URL: click tracking ka link (khali = tracking band)"],
-                              value_input_option="RAW")
+    for key, val in defaults:
+        if key not in settings:
+            settings[key] = val
+            control_ws.append_row([key, val], value_input_option="RAW")
+            added = True
+    if added and not has_note:
+        control_ws.append_row([
+            "(note)",
+            "SEND_MODE: live/dry/stop | TRACK_URL: click tracking link (khali=band) | PER_SENDER_PER_RUN: har account har run "
+            "(max 5) | DAILY_MAX_PER_SENDER: har account 24h me (max 60) | PRIORITY: score / random / newest / oldest"],
+            value_input_option="RAW")
     return settings
 
 
 def run_once():
-    global DRY_RUN
+    global DRY_RUN, PER_SENDER_PER_RUN, DAILY_MAX_PER_SENDER
     senders = load_senders()
     if not senders:
         sys.exit("Koi GMAIL_n_ADDRESS / GMAIL_n_APPPASS env var nahi mila.")
@@ -886,11 +908,15 @@ def run_once():
     gc, leads_ws, out_ws, unsub_ws, control_ws = T["gc"], T["leads"], T["out"], T["unsub"], T["control"]
 
     # SHEET KA "Control" TAB = asli switch
-    sheet_val, track_url = None, ""
+    sheet_val, track_url, settings = None, "", {}
     try:
         settings = read_settings(control_ws)
         sheet_val = settings.get("SEND_MODE", "").lower()
         track_url = settings.get("TRACK_URL", "").strip() or os.environ.get("TRACK_URL", "").strip()
+        PER_SENDER_PER_RUN = min(max(to_int(settings.get("PER_SENDER_PER_RUN")) or PER_SENDER_PER_RUN, 1),
+                                 HARD_MAX_PER_SENDER_PER_RUN)
+        DAILY_MAX_PER_SENDER = min(max(to_int(settings.get("DAILY_MAX_PER_SENDER")) or DAILY_MAX_PER_SENDER, 1),
+                                   HARD_MAX_DAILY_PER_SENDER)
     except Exception as e:
         log.warning("Control tab padh nahi saka (%s) — GitHub env wala mode chalega.", e)
     if sheet_val:
@@ -898,9 +924,17 @@ def run_once():
     if track_url and not track_url.startswith("http"):
         log.warning("TRACK_URL 'http' se shuru nahi hota — click tracking band.")
         track_url = ""
+    per_sender = min(5, max(1, to_int(settings.get("PER_SENDER_PER_RUN")) or PER_SENDER_PER_RUN))
+    daily_max = min(60, max(1, to_int(settings.get("DAILY_MAX_PER_SENDER")) or DAILY_MAX_PER_SENDER))
+    priority = (settings.get("PRIORITY") or "score").strip().lower()
     log.info("FINAL MODE: %s | GitHub env SEND_MODE=%r | Sheet 'Control' tab SEND_MODE=%r | click tracking: %s",
              "DRY RUN (koi email nahi jayegi)" if DRY_RUN else "LIVE (asli emails)", SEND_MODE_RAW, sheet_val,
              "ON" if track_url else "OFF")
+    log.info("Settings: har account har run %s mails | 24h me max %s | naye leads ki tarteeb: %s",
+             per_sender, daily_max, priority)
+    log.info("SPEED: har account %s mail/run, max %s/din | %s accounts => max %s mails/din",
+             PER_SENDER_PER_RUN, DAILY_MAX_PER_SENDER, len(senders),
+             len(senders) * min(PER_SENDER_PER_RUN * 24, DAILY_MAX_PER_SENDER))
     unsub = {r["Email or Domain"].lower() for r in sheet_rows(unsub_ws) if r.get("Email or Domain")}
 
     out_rows = sheet_rows(out_ws)
@@ -1002,15 +1036,15 @@ def run_once():
             except ValueError:
                 return 0
 
-        new_pool = sorted([r for r in out_rows if r["Status"] == "new"],
-                          key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
-        max_per_run = PER_SENDER_PER_RUN * len(senders)   # poori run ki HARD limit
+        new_pool = order_pool([r for r in out_rows if r["Status"] == "new"], priority, score)
+        log.info("Queue: %s naye leads intezar me (tarteeb: %s)", len(new_pool), priority)
+        max_per_run = per_sender * len(senders)   # poori run ki HARD limit
 
         for s in senders:
             if total_sent >= max_per_run:
                 break
-            quota = min(PER_SENDER_PER_RUN - recent.get(s["email"], 0),
-                        DAILY_MAX_PER_SENDER - daily.get(s["email"], 0))
+            quota = min(per_sender - recent.get(s["email"], 0),
+                        daily_max - daily.get(s["email"], 0))
             if quota <= 0:
                 log.info("%s: quota pura, skip.", s["email"])
                 continue
@@ -1098,7 +1132,9 @@ def run_once():
         t = parse_iso(r["Last Sent"])
         if t and t > now - timedelta(hours=24):
             sent24 += 1
-    write_dashboard(T["dashboard"], senders, sent24, now)
+    waiting = sum(1 for r in out_rows if r["Status"] == "new")
+    per_day = len(senders) * min(PER_SENDER_PER_RUN * 24, DAILY_MAX_PER_SENDER)
+    write_dashboard(T["dashboard"], senders, sent24, now, waiting, per_day)
     write_replies_tab(T["replies"], out_rows)
 
     counts = {}
