@@ -80,7 +80,57 @@ OUT_HEADERS = [
     "Email", "Store Name", "Domain", "Quality", "Lead Score",   # A-E
     "Status", "Stage", "Sender", "Message-ID", "Subject",       # F-J
     "Last Sent", "Next Due", "Notes",                           # K-M
+    # ---- tracking columns (v3) ----
+    "Sent", "Emails Sent", "First Sent",                        # N-P
+    "Replied", "Reply Count", "Replied At", "Reply Type", "Reply Snippet",   # Q-U
+    "Bounced", "Clicks", "First Click", "Last Click", "Track ID",            # V-Z
 ]
+ROW_COLS = OUT_HEADERS[5:]          # F..Z  (jo script update karti hai)
+LAST_COL = "Z"
+TRACK_SALT = os.environ.get("TRACK_SALT", "sm")
+
+
+def to_int(v):
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+
+def make_row(d):
+    return [d.get(h, "") for h in OUT_HEADERS]
+
+
+def row_vals(r):
+    return [r.get(h, "") for h in ROW_COLS]
+
+
+def sig(r):
+    return tuple(str(v) for v in row_vals(r))
+
+
+def make_tid(email):
+    return hashlib.sha1((email + TRACK_SALT).encode()).hexdigest()[:10]
+
+
+def derive(r):
+    """Sheet ke friendly columns (Sent / Emails Sent / Bounced / Replied ...) Stage+Status se nikalta hai."""
+    n = to_int(r.get("Stage"))
+    r["Emails Sent"] = n
+    if n > 0:
+        r["Sent"] = f"Sent {min(n, 3)}/3"
+    elif r.get("Status") == "skipped":
+        r["Sent"] = "Skipped"
+    elif r.get("Status") == "unsub":
+        r["Sent"] = "Unsubscribed"
+    else:
+        r["Sent"] = "Not sent"
+    r["Bounced"] = "Yes" if r.get("Status") == "bounced" else "No"
+    r["Replied"] = "Yes" if (r.get("Replied") == "Yes" or r.get("Status") == "replied") else "No"
+    r["Reply Count"] = to_int(r.get("Reply Count"))
+    if r["Replied"] == "Yes" and r["Reply Count"] == 0:
+        r["Reply Count"] = 1
+    r["Clicks"] = to_int(r.get("Clicks"))
 
 FREE_PROVIDERS = {"gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
                   "live.com", "icloud.com", "aol.com", "proton.me", "protonmail.com"}
@@ -171,6 +221,15 @@ def get_client():
     return gspread.authorize(UserCreds.from_authorized_user_file("token.json", SCOPES))
 
 
+def ensure_headers(ws, headers):
+    cur = ws.row_values(1)
+    if cur[:len(headers)] != headers:
+        if ws.col_count < len(headers):
+            ws.add_cols(len(headers) - ws.col_count)
+        ws.update(values=[headers], range_name="A1")
+        log.info("Tab '%s' ke naye tracking columns add ho gaye.", ws.title)
+
+
 def connect():
     if not SHEET_ID:
         sys.exit("GOOGLE_SHEET_ID secret set karein (nayi lead-finder sheet ka ID/URL).")
@@ -182,13 +241,25 @@ def connect():
         try:
             return sh.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+            ws = sh.add_worksheet(title=title, rows=1000, cols=max(len(headers), 10))
             ws.update(values=[headers], range_name="A1")
             ws.freeze(rows=1)
             return ws
 
-    return (gc, sh.worksheet(LEADS_TAB), tab(OUTREACH_TAB, OUT_HEADERS), tab(UNSUB_TAB, ["Email or Domain"]),
-            tab("Control", ["Setting", "Value"]))
+    out = tab(OUTREACH_TAB, OUT_HEADERS)
+    ensure_headers(out, OUT_HEADERS)
+    try:
+        clicks = sh.worksheet("Clicks")
+    except gspread.exceptions.WorksheetNotFound:
+        clicks = None
+    return {
+        "gc": gc, "leads": sh.worksheet(LEADS_TAB), "out": out,
+        "unsub": tab(UNSUB_TAB, ["Email or Domain"]), "control": tab("Control", ["Setting", "Value"]),
+        "replies": tab("Replies", ["Store Name", "Email", "Domain", "Quality", "Replied At", "Reply Snippet",
+                                   "Emails Sent", "Sender", "Status"]),
+        "dashboard": tab("Dashboard", ["Metric", "Value"]),
+        "clicks": clicks,
+    }
 
 
 def sheet_rows(ws):
@@ -212,11 +283,10 @@ def append_in_chunks(ws, rows):
 
 def update_row(out_ws, r):
     """True agar sheet me save ho gaya, warna False."""
-    vals = [r["Status"], r["Stage"], r["Sender"], r["Message-ID"], r["Subject"],
-            r["Last Sent"], r["Next Due"], r["Notes"]]
     for attempt in range(4):
         try:
-            out_ws.update(values=[vals], range_name=f"F{r['_row']}:M{r['_row']}", value_input_option="RAW")
+            out_ws.update(values=[row_vals(r)], range_name=f"F{r['_row']}:{LAST_COL}{r['_row']}",
+                          value_input_option="RAW")
             return True
         except Exception as e:
             log.warning("Row update retry %s: %s", attempt + 1, e)
@@ -227,11 +297,9 @@ def update_row(out_ws, r):
 
 def batch_update_rows(out_ws, rows):
     """Bahut si rows ek hi API call me (Sheets ki '60 writes/min' quota se bachne ke liye)."""
-    payload = [{"range": f"F{r['_row']}:M{r['_row']}",
-                "values": [[r["Status"], r["Stage"], r["Sender"], r["Message-ID"], r["Subject"],
-                            r["Last Sent"], r["Next Due"], r["Notes"]]]} for r in rows]
-    for i in range(0, len(payload), 300):
-        chunk = payload[i:i + 300]
+    payload = [{"range": f"F{r['_row']}:{LAST_COL}{r['_row']}", "values": [row_vals(r)]} for r in rows]
+    for i in range(0, len(payload), 200):
+        chunk = payload[i:i + 200]
         for attempt in range(5):
             try:
                 out_ws.batch_update(chunk, value_input_option="RAW")
@@ -240,7 +308,25 @@ def batch_update_rows(out_ws, rows):
                 log.warning("Batch update retry %s: %s", attempt + 1, e)
                 time.sleep(10 * (attempt + 1))
         else:
-            log.error("Batch update fail (%s rows) — sending ab bhi safe hai, agli run me dobara try hoga.", len(chunk))
+            log.error("Batch update fail (%s rows) — agli run me dobara try hoga.", len(chunk))
+
+
+def block_write_all(out_ws, rows):
+    """Bohot saari rows badli hon (jaise pehli baar naye columns bharna) to F:Z poora block chunks me likho."""
+    rows = sorted(rows, key=lambda r: r["_row"])
+    for i in range(0, len(rows), 3000):
+        chunk = rows[i:i + 3000]
+        start, end = chunk[0]["_row"], chunk[-1]["_row"]
+        for attempt in range(5):
+            try:
+                out_ws.update(values=[row_vals(r) for r in chunk], range_name=f"F{start}:{LAST_COL}{end}",
+                              value_input_option="RAW")
+                break
+            except Exception as e:
+                log.warning("Block write retry %s: %s", attempt + 1, e)
+                time.sleep(10 * (attempt + 1))
+        else:
+            log.error("Block write fail (rows %s-%s).", start, end)
 
 
 def is_unsub(email, unsub):
@@ -292,9 +378,11 @@ def migrate_old_sheet(gc, out_ws, out_rows, senders, unsub):
         store = store_name_from_url(url)
         domain = re.sub(r"https?://(www\.)?", "", url).split("/")[0].lower()
         status = "unsub" if is_unsub(email, unsub) else "active"
-        rows.append([email, store, domain, "", "0", status, 1, sender, "",
-                     f"A quick idea for {store}'s homepage", "", due if status == "active" else "",
-                     "migrated from old sheet"])
+        rows.append(make_row({
+            "Email": email, "Store Name": store, "Domain": domain, "Lead Score": "0", "Status": status,
+            "Stage": 1, "Sender": sender, "Subject": f"A quick idea for {store}'s homepage",
+            "Next Due": due if status == "active" else "", "Notes": "migrated from old sheet",
+        }))
     append_in_chunks(out_ws, rows)
     log.info("Purani sheet se %s already-emailed stores import hue (ab sirf follow-ups jayenge).", len(rows))
 
@@ -321,8 +409,11 @@ def sync_leads(leads_rows, out_ws, out_rows, unsub):
             status, note = "skipped", "legacy theme (no OS2.0 sections)"
         elif is_unsub(email, unsub):
             status, note = "unsub", "in Unsubscribed tab"
-        new_rows.append([email, lead.get("Store Name", ""), lead.get("Domain", ""), quality,
-                         lead.get("Lead Score", "0"), status, 0, "", "", "", "", "", note])
+        new_rows.append(make_row({
+            "Email": email, "Store Name": lead.get("Store Name", ""), "Domain": lead.get("Domain", ""),
+            "Quality": quality, "Lead Score": lead.get("Lead Score", "0"), "Status": status, "Stage": 0,
+            "Notes": note,
+        }))
     append_in_chunks(out_ws, new_rows)
     if new_rows:
         log.info("Outreach tab me %s naye leads add hue.", len(new_rows))
@@ -390,7 +481,7 @@ def pick_variant(seed, options):
     return options[int(hashlib.md5(seed.encode()).hexdigest(), 16) % len(options)]
 
 
-def build_message(lead, stage, base_subject=None):
+def build_message(lead, stage, base_subject=None, link=None):
     """stage 0 = pehli email, 1/2 = follow-ups. Return (subject, body)."""
     store = (lead.get("Store Name") or "").strip() or "your store"
     domain = lead.get("Domain", "")
@@ -398,6 +489,7 @@ def build_message(lead, stage, base_subject=None):
     picks = picks_for(lead)
     names = [p[0] for p in picks]
     missing = [p[2] for p in picks if p[2]][:2]
+    link = link or APP_URL
     first = picks[0]
     extras = [x for x in ("Hero Banner Slider", "Logo Carousel", "Contact Form", "Promo Banner") if x not in names][:3]
 
@@ -425,7 +517,7 @@ def build_message(lead, stage, base_subject=None):
             f"{observation}\n\n"
             f"We built {APP_NAME}, a free Shopify app that lets you add sections without touching any code — "
             f"{join_and(names)}, plus {join_and(extras)} and more.{theme_line}\n\n"
-            f"You can check it out here:\n{APP_URL}\n\n"
+            f"You can check it out here:\n{link}\n\n"
             f"If you'd like a quick free demo of how {names[0]} could look on {store}, just reply to this email.\n\n"
             f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
         )
@@ -437,14 +529,14 @@ def build_message(lead, stage, base_subject=None):
                 f"Hi {store} team,\n\n"
                 f"Just floating this back up in case it got buried. One example: {first[0]} lets you "
                 f"{first[1]} — set up in a couple of minutes from the theme editor, and the app is free.\n\n"
-                f"Happy to send a quick demo for {store} if useful: {APP_URL}\n\n"
+                f"Happy to send a quick demo for {store} if useful: {link}\n\n"
                 f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
             )
         else:
             body = (
                 f"Hi {store} team,\n\n"
                 f"Last note from me — I don't want to clutter your inbox. If polishing {store}'s homepage "
-                f"is on your list, {APP_NAME} is here whenever you need it: {APP_URL}\n\n"
+                f"is on your list, {APP_NAME} is here whenever you need it: {link}\n\n"
                 f"If it's not a fit, no worries at all.\n\n"
                 f"Best regards,\n{FROM_NAME}\n{APP_NAME} Team"
             )
@@ -499,11 +591,48 @@ def text_of(msg):
     return ""
 
 
-def check_inbox(sender, active):
-    """active: {email: row}. Returns [(email, 'replied'|'unsub'|'bounced')]. Headers bulk me, body sirf match par."""
+AUTO_SUBJ_RE = re.compile(
+    r"(auto[- ]?reply|automatic reply|autoreply|out of office|out-of-office|away from (the )?office|vacation|"
+    r"request received|we(?:'ve| have) received|thank you for (contacting|reaching)|do not reply|\[ticket|ticket #)", re.I)
+
+
+def is_auto_message(h):
+    if (h.get("Auto-Submitted") or "").strip().lower() not in ("", "no"):
+        return True
+    if (h.get("Precedence") or "").strip().lower() in ("auto_reply", "bulk", "junk"):
+        return True
+    if h.get("X-Autoreply") or h.get("X-Autorespond") or h.get("X-Autoresponder") or h.get("X-Autoresponse"):
+        return True
+    return bool(AUTO_SUBJ_RE.search(h.get("Subject") or ""))
+
+
+def clean_snippet(body, n=180):
+    """Reply ka apna likha hua hissa (quoted purani email nikal kar)."""
+    lines = []
+    for ln in (body or "").splitlines():
+        t = ln.strip()
+        if t.startswith(">"):
+            continue
+        if re.match(r"^(on .+wrote:|-{2,}\s*original message|from:\s|sent from my)", t, re.I):
+            break
+        lines.append(t)
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()[:n]
+
+
+def msg_date_iso(hdr_date):
+    try:
+        from email.utils import parsedate_to_datetime
+        return iso(parsedate_to_datetime(hdr_date).astimezone(timezone.utc))
+    except Exception:
+        return ""
+
+
+def check_inbox(sender, tracked):
+    """tracked: {email: row}. Returns list of events:
+       {'email','kind': 'reply'|'unsub'|'auto'|'bounced','date','snippet'}"""
     events = []
     domain_map = {}
-    for e in active:
+    for e in tracked:
         d = e.split("@")[-1]
         if not is_free(d):
             domain_map.setdefault(d, e)
@@ -515,24 +644,32 @@ def check_inbox(sender, active):
         _, data = M.search(None, "SINCE", since)
         ids = data[0].split()
 
-        candidates = []  # (imap_id, matched_email or None(bounce))
+        fields = "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE AUTO-SUBMITTED PRECEDENCE X-AUTOREPLY X-AUTORESPOND X-AUTORESPONDER X-AUTORESPONSE)])"
+        candidates = []  # (imap_id, matched_email or None(bounce), headers)
         for i in range(0, len(ids), 300):
-            _, resp = M.fetch(b",".join(ids[i:i + 300]), "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+            _, resp = M.fetch(b",".join(ids[i:i + 300]), fields)
             for item in resp:
                 if not isinstance(item, tuple):
                     continue
                 mid = item[0].split()[0]
-                from_addr = parseaddr(message_from_bytes(item[1]).get("From", ""))[1].lower()
+                h = message_from_bytes(item[1])
+                hd = {k: h.get(k) for k in ("From", "Subject", "Date", "Auto-Submitted", "Precedence",
+                                            "X-Autoreply", "X-Autorespond", "X-Autoresponder", "X-Autoresponse")}
+                from_addr = parseaddr(hd["From"] or "")[1].lower()
                 if from_addr == sender["email"]:
                     continue
                 if re.match(r"(mailer-daemon|postmaster)@", from_addr):
-                    candidates.append((mid, None))
-                elif from_addr in active:
-                    candidates.append((mid, from_addr))
+                    candidates.append((mid, None, hd))
+                elif from_addr in tracked:
+                    candidates.append((mid, from_addr, hd))
                 elif from_addr.split("@")[-1] in domain_map:
-                    candidates.append((mid, domain_map[from_addr.split("@")[-1]]))
+                    candidates.append((mid, domain_map[from_addr.split("@")[-1]], hd))
 
-        for mid, matched in candidates[:300]:
+        for mid, matched, hd in candidates[:400]:
+            date = msg_date_iso(hd.get("Date") or "")
+            if matched is not None and is_auto_message(hd):
+                events.append({"email": matched, "kind": "auto", "date": date, "snippet": ""})
+                continue
             _, fetched = M.fetch(mid, "(BODY.PEEK[]<0.9000>)")
             raw = next((x[1] for x in fetched if isinstance(x, tuple)), None)
             if not raw:
@@ -541,20 +678,200 @@ def check_inbox(sender, active):
             if matched is None:  # bounce
                 blob = body + " " + raw.decode("utf-8", errors="ignore")
                 for e in set(x.lower() for x in EMAIL_RE.findall(blob)):
-                    if e in active:
-                        events.append((e, "bounced"))
+                    if e in tracked:
+                        events.append({"email": e, "kind": "bounced", "date": date, "snippet": ""})
             else:
-                events.append((matched, "unsub" if STOP_RE.search(body.strip()[:300]) else "replied"))
+                kind = "unsub" if STOP_RE.search(body.strip()[:300]) else "reply"
+                events.append({"email": matched, "kind": kind, "date": date, "snippet": clean_snippet(body)})
         M.logout()
     except Exception as e:
         log.warning("IMAP check fail (%s): %s", sender["email"], e)
     return events
 
 
+def apply_events(tracked, events, now):
+    """Inbox events ko rows me likho: reply count, replied at, snippet, type, status. Returns set of rows touched."""
+    by = {}
+    for ev in events:
+        by.setdefault(ev["email"], []).append(ev)
+    touched = {}
+    for email, evs in by.items():
+        r = tracked.get(email)
+        if not r:
+            continue
+        real = [e for e in evs if e["kind"] == "reply"]
+        unsubs = [e for e in evs if e["kind"] == "unsub"]
+        autos = [e for e in evs if e["kind"] == "auto"]
+        bounces = [e for e in evs if e["kind"] == "bounced"]
+        if bounces and not real and not unsubs and r["Status"] != "bounced":
+            r["Status"], r["Notes"] = "bounced", f"bounce detected {iso(now)}"
+            log.info("%s -> bounced", email)
+        if real:
+            first = min(real, key=lambda e: e["date"] or "9")
+            r["Reply Count"] = max(to_int(r.get("Reply Count")), len(real))
+            r["Replied"], r["Reply Type"] = "Yes", "reply"
+            if not r.get("Replied At"):
+                r["Replied At"] = first["date"]
+            if not r.get("Reply Snippet"):
+                r["Reply Snippet"] = first["snippet"]
+            if r["Status"] not in ("unsub", "bounced", "replied"):
+                r["Status"], r["Notes"] = "replied", f"reply detected {iso(now)}"
+                log.info("%s -> replied", email)
+        if unsubs:
+            if r["Status"] != "unsub":
+                log.info("%s -> unsub", email)
+            r["Status"], r["Notes"], r["Next Due"] = "unsub", f"unsubscribe request {iso(now)}", ""
+            r["Reply Type"] = "unsubscribe"
+            if not r.get("Reply Snippet"):
+                r["Reply Snippet"] = unsubs[0]["snippet"]
+        if autos and not real and not unsubs and not r.get("Reply Type"):
+            r["Reply Type"] = "auto-reply"
+        touched[r["_row"]] = r
+    return touched
+
+
+BOT_UA_RE = re.compile(
+    r"(bot|spider|crawl|scan|proofpoint|mimecast|barracuda|safelinks|microsoft office|ms-office|outlook|"
+    r"googleimageproxy|curl|python|wget|headless|preview|slack|whatsapp|facebookexternalhit|twitterbot|"
+    r"linkedinbot|go-http|java/|okhttp|libwww|urlscan)", re.I)
+
+
+def apply_clicks(clicks_ws, out_rows):
+    """'Clicks' tab (Apps Script se bharta hai) -> Outreach me Clicks / First Click / Last Click.
+    Bots aur email-security scanners (send ke 15 sec ke andar click, ya bot user-agent) ignore hote hain."""
+    if clicks_ws is None:
+        return 0
+    by_tid = {r["Track ID"]: r for r in out_rows if r.get("Track ID")}
+    if not by_tid:
+        return 0
+    times = {}
+    for row in clicks_ws.get_all_values()[1:]:
+        if len(row) < 2:
+            continue
+        ts, tid, ua = row[0].strip(), row[1].strip(), (row[2] if len(row) > 2 else "")
+        r = by_tid.get(tid)
+        if not r or BOT_UA_RE.search(ua):
+            continue
+        try:
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+        except Exception:
+            t = None
+        ls = parse_iso(r.get("Last Sent", ""))
+        if t and ls and 0 <= (t - ls).total_seconds() < 15:
+            continue
+        times.setdefault(tid, []).append(t)
+    n = 0
+    for tid, ts_list in times.items():
+        r = by_tid[tid]
+        r["Clicks"] = len(ts_list)
+        valid = [t for t in ts_list if t]
+        if valid:
+            r["First Click"], r["Last Click"] = iso(min(valid)), iso(max(valid))
+        n += 1
+    return n
+
+
+# ============================================================
+# DASHBOARD + REPLIES TAB
+# ============================================================
+def write_dashboard(ws, senders, sent24, now):
+    O = OUTREACH_TAB
+    rows = [
+        ["SECTION MASTER — OUTREACH DASHBOARD", ""],
+        ["Last updated (UTC)", iso(now)],
+        ["", ""],
+        ["Stores in list", f"=COUNTA({O}!A2:A)"],                                    # 4
+        ["Waiting (not emailed yet)", f'=COUNTIF({O}!F2:F,"new")'],                  # 5
+        ["Stores emailed (at least 1 email)", f'=COUNTIF({O}!O2:O,">0")'],           # 6
+        ["Total emails sent", f"=SUM({O}!O2:O)"],                                    # 7
+        ["Emails sent in last 24h", sent24],                                         # 8
+        ["Sent 1/3", f'=COUNTIF({O}!N2:N,"Sent 1/3")'],                              # 9
+        ["Sent 2/3", f'=COUNTIF({O}!N2:N,"Sent 2/3")'],                              # 10
+        ["Sent 3/3 (sequence complete)", f'=COUNTIF({O}!N2:N,"Sent 3/3")'],          # 11
+        ["Replies (real people)", f'=COUNTIF({O}!Q2:Q,"Yes")'],                      # 12
+        ["Reply rate", "=IFERROR(B12/B6,0)"],                                        # 13
+        ["Auto-replies", f'=COUNTIF({O}!T2:T,"auto-reply")'],                        # 14
+        ["Unsubscribes", f'=COUNTIF({O}!T2:T,"unsubscribe")'],                       # 15
+        ["Bounced", f'=COUNTIF({O}!V2:V,"Yes")'],                                    # 16
+        ["Bounce rate", "=IFERROR(B16/B6,0)"],                                       # 17
+        ["Stores that clicked the link", f'=COUNTIF({O}!W2:W,">0")'],                # 18
+        ["Click rate", "=IFERROR(B18/B6,0)"],                                        # 19
+        ["Total clicks", f"=SUM({O}!W2:W)"],                                         # 20
+        ["", ""],                                                                    # 21
+        ["BY SENDER", "Stores emailed", "Replies", "Reply rate", "Bounced"],         # 22
+    ]
+    pct_cells = ["B13", "B17", "B19"]
+    for s in senders:
+        n = len(rows) + 1
+        rows.append([s["email"],
+                     f'=COUNTIFS({O}!H2:H,A{n},{O}!O2:O,">0")',
+                     f'=COUNTIFS({O}!H2:H,A{n},{O}!Q2:Q,"Yes")',
+                     f"=IFERROR(C{n}/B{n},0)",
+                     f'=COUNTIFS({O}!H2:H,A{n},{O}!V2:V,"Yes")'])
+        pct_cells.append(f"D{n}")
+    rows.append(["", ""])
+    rows.append(["BY LEAD QUALITY", "Stores emailed", "Replies", "Reply rate", "Bounced"])
+    for label, crit in (("HOT", "HOT"), ("WARM", "WARM"), ("GOOD", "GOOD"), ("(old campaign / no quality)", "")):
+        n = len(rows) + 1
+        qcrit = f'"{crit}"'
+        rows.append([label,
+                     f'=COUNTIFS({O}!D2:D,{qcrit},{O}!O2:O,">0")',
+                     f'=COUNTIFS({O}!D2:D,{qcrit},{O}!Q2:Q,"Yes")',
+                     f"=IFERROR(C{n}/B{n},0)",
+                     f'=COUNTIFS({O}!D2:D,{qcrit},{O}!V2:V,"Yes")'])
+        pct_cells.append(f"D{n}")
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    try:
+        ws.clear()
+        ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED")
+        ws.format(pct_cells, {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}})
+        ws.format("A1", {"textFormat": {"bold": True, "fontSize": 13}})
+    except Exception as e:
+        log.warning("Dashboard update fail: %s", e)
+
+
+def write_replies_tab(ws, rows):
+    hdr = ["Store Name", "Email", "Domain", "Quality", "Replied At", "Reply Snippet", "Emails Sent", "Sender", "Status"]
+    data = [[r["Store Name"], r["Email"], r["Domain"], r["Quality"], r["Replied At"], r["Reply Snippet"],
+             r["Emails Sent"], r["Sender"], r["Status"]] for r in rows if r.get("Replied") == "Yes"]
+    data.sort(key=lambda x: x[4], reverse=True)
+    try:
+        ws.clear()
+        ws.update(values=[hdr] + data, range_name="A1", value_input_option="RAW")
+        ws.freeze(rows=1)
+    except Exception as e:
+        log.warning("Replies tab update fail: %s", e)
+
+
 # ============================================================
 # ONE RUN
 # ============================================================
 LIVE_VALUES = ("live", "1", "true", "yes", "on")
+
+
+def read_settings(control_ws):
+    """Control tab: 'Setting | Value' rows -> dict. Missing rows automatically add hoti hain."""
+    settings = {}
+    for row in control_ws.get_all_values()[1:]:
+        if row and row[0].strip():
+            settings[row[0].strip().upper()] = (row[1] if len(row) > 1 else "").strip()
+    added = False
+    if "SEND_MODE" not in settings:
+        settings["SEND_MODE"] = "dry" if DRY_RUN else "live"
+        control_ws.append_row(["SEND_MODE", settings["SEND_MODE"]], value_input_option="RAW")
+        added = True
+    if "TRACK_URL" not in settings:
+        settings["TRACK_URL"] = ""
+        control_ws.append_row(["TRACK_URL", ""], value_input_option="RAW")
+        added = True
+    if added:
+        control_ws.append_row(["(note)", "SEND_MODE: live = bhejo | dry = sirf preview | stop = band.  "
+                                         "TRACK_URL: click tracking ka link (khali = tracking band)"],
+                              value_input_option="RAW")
+    return settings
 
 
 def run_once():
@@ -564,26 +881,25 @@ def run_once():
         sys.exit("Koi GMAIL_n_ADDRESS / GMAIL_n_APPPASS env var nahi mila.")
     log.info("%s Gmail accounts load hue | mode: %s | SEND_MODE env = %r", len(senders), "DRY RUN" if DRY_RUN else "LIVE", SEND_MODE_RAW)
 
-    gc, leads_ws, out_ws, unsub_ws, control_ws = connect()
+    T = connect()
+    gc, leads_ws, out_ws, unsub_ws, control_ws = T["gc"], T["leads"], T["out"], T["unsub"], T["control"]
 
-    # SHEET KA "Control" TAB = asli switch (GitHub variable/yml par bharosa nahi karna parta)
-    #   SEND_MODE = live  -> emails jati hain | dry -> sirf preview | stop -> band
-    sheet_val = None
+    # SHEET KA "Control" TAB = asli switch
+    sheet_val, track_url = None, ""
     try:
-        for row in control_ws.get_all_values()[1:]:
-            if row and row[0].strip().upper() == "SEND_MODE":
-                sheet_val = (row[1] if len(row) > 1 else "").strip().lower()
-        if sheet_val is None:
-            sheet_val = "dry" if DRY_RUN else "live"
-            control_ws.append_row(["SEND_MODE", sheet_val], value_input_option="RAW")
-            control_ws.append_row(["(note)", "B2 = live -> emails jayengi | dry -> sirf preview | stop -> band"],
-                                  value_input_option="RAW")
+        settings = read_settings(control_ws)
+        sheet_val = settings.get("SEND_MODE", "").lower()
+        track_url = settings.get("TRACK_URL", "").strip() or os.environ.get("TRACK_URL", "").strip()
     except Exception as e:
         log.warning("Control tab padh nahi saka (%s) — GitHub env wala mode chalega.", e)
     if sheet_val:
         DRY_RUN = sheet_val not in LIVE_VALUES
-    log.info("FINAL MODE: %s | GitHub env SEND_MODE=%r | Sheet 'Control' tab SEND_MODE=%r",
-             "DRY RUN (koi email nahi jayegi)" if DRY_RUN else "LIVE (asli emails)", SEND_MODE_RAW, sheet_val)
+    if track_url and not track_url.startswith("http"):
+        log.warning("TRACK_URL 'http' se shuru nahi hota — click tracking band.")
+        track_url = ""
+    log.info("FINAL MODE: %s | GitHub env SEND_MODE=%r | Sheet 'Control' tab SEND_MODE=%r | click tracking: %s",
+             "DRY RUN (koi email nahi jayegi)" if DRY_RUN else "LIVE (asli emails)", SEND_MODE_RAW, sheet_val,
+             "ON" if track_url else "OFF")
     unsub = {r["Email or Domain"].lower() for r in sheet_rows(unsub_ws) if r.get("Email or Domain")}
 
     out_rows = sheet_rows(out_ws)
@@ -594,156 +910,200 @@ def run_once():
     sync_leads(leads_rows, out_ws, out_rows, unsub)
     out_rows = sheet_rows(out_ws)
     lead_by_email = {l["Email"].lower(): l for l in leads_rows if l.get("Email")}
-
     now = utcnow()
-
     log.info("Leads tab: %s rows | Outreach tab: %s rows", len(leads_rows), len(out_rows))
-    changed = {}
 
-    # 1) replies / bounces / unsubscribes (inbox se)
-    active = {r["Email"].lower(): r for r in out_rows if r["Status"] == "active"}
+    original = {r["_row"]: sig(r) for r in out_rows}   # is run ke shuru ki haalat (kya badla, ye dekhne ke liye)
+
+    # ---- 1) inbox: replies / auto-replies / bounces / unsubscribes ----
+    tracked = {r["Email"].lower(): r for r in out_rows if to_int(r["Stage"]) > 0}
+    legacy_replied = {e for e, r in tracked.items() if r["Status"] == "replied" and not r.get("Reply Type")}
+    events = []
     for s in senders:
-        for email, kind in check_inbox(s, dict(active)):
-            r = active.get(email)
-            if r:
-                r["Status"], r["Notes"] = kind, f"{kind} detected {iso(now)}"
-                changed[r["_row"]] = r
-                log.info("%s -> %s", email, kind)
-                active.pop(email, None)
+        events += check_inbox(s, tracked)
+    apply_events(tracked, events, now)
+    # purani (v2) 'replied' marking me auto-replies bhi thin: agar ab scan me sirf auto-reply mile to wapas active
+    seen_kinds = {}
+    for ev in events:
+        seen_kinds.setdefault(ev["email"], set()).add(ev["kind"])
+    for e in legacy_replied:
+        kinds = seen_kinds.get(e)
+        r = tracked[e]
+        if kinds and kinds <= {"auto"} and r["Status"] == "replied":
+            r["Status"], r["Replied"], r["Reply Count"], r["Reply Type"] = "active", "No", 0, "auto-reply"
+            r["Notes"] = "auto-reply (not a real reply)"
 
-    # 1b) junk / placeholder / galat addresses jo abhi 'new' ya 'active' hain -> skipped (kabhi email nahi jayegi)
+    # ---- 1b) junk / placeholder addresses jo abhi 'new' ya 'active' hain -> skipped ----
     bad_count = 0
     for r in out_rows:
         if r["Status"] in ("new", "active"):
             why = email_problem(r["Email"])
             if why:
                 r["Status"], r["Notes"], r["Next Due"] = "skipped", f"bad email: {why}", ""
-                changed[r["_row"]] = r
                 bad_count += 1
     if bad_count:
         log.info("%s junk/galat email addresses skip mark hue.", bad_count)
 
-    # 2) manual Unsubscribed tab
+    # ---- 2) manual Unsubscribed tab ----
     for r in out_rows:
         if r["Status"] in ("new", "active") and is_unsub(r["Email"].lower(), unsub):
             r["Status"], r["Notes"] = "unsub", "in Unsubscribed tab"
-            changed[r["_row"]] = r
 
+    # ---- 3) link clicks ----
+    try:
+        clicked = apply_clicks(T["clicks"], out_rows)
+        if clicked:
+            log.info("Click tracking: %s stores ne link click kiya.", clicked)
+    except Exception as e:
+        log.warning("Clicks tab process nahi hua: %s", e)
+
+    # ---- 4) friendly columns + sheet me sirf jo badla wo likho ----
+    for r in out_rows:
+        derive(r)
+    changed = [r for r in out_rows if sig(r) != original[r["_row"]]]
+    if len(changed) > 600:
+        log.info("%s rows update ho rahi hain (naye tracking columns) — block me likh raha hun...", len(changed))
+        block_write_all(out_ws, out_rows)
+    elif changed:
+        batch_update_rows(out_ws, changed)
     if changed:
-        batch_update_rows(out_ws, list(changed.values()))
-        log.info("Sheet me %s rows ka status ek saath update hua.", len(changed))
+        log.info("Sheet me %s rows update hui.", len(changed))
+    original = {r["_row"]: sig(r) for r in out_rows}
 
-    # 3) CIRCUIT BREAKER: pichle 72 ghante ki bheji hui mails me bounce rate zyada ho to sending band
+    # ---- 5) CIRCUIT BREAKER ----
     since72 = now - timedelta(hours=72)
     sent72 = [r for r in out_rows if (parse_iso(r["Last Sent"]) or since72) > since72]
     bounced72 = [r for r in sent72 if r["Status"] == "bounced"]
-    if len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO:
+    paused = len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO
+    if paused:
         log.error("SENDING PAUSED: pichle 72h me %s me se %s bounce (%.0f%%) — limit %.0f%%. "
                   "Pehle bounce ki wajah dekhein, phir Outreach tab me bounced rows check karein.",
                   len(sent72), len(bounced72), 100 * len(bounced72) / len(sent72), 100 * BOUNCE_PAUSE_RATIO)
-        return
 
-    # 4) quota + hard caps (cron thora late/early ho to bhi half-run na kate)
-    window_start = now - timedelta(minutes=QUOTA_WINDOW_MINUTES)
-    day_start = now - timedelta(hours=24)
-    recent, daily = {}, {}
-    for r in out_rows:
-        t, sd = parse_iso(r["Last Sent"]), r["Sender"].lower()
-        if sd and t:
-            if t > window_start:
-                recent[sd] = recent.get(sd, 0) + 1
-            if t > day_start:
-                daily[sd] = daily.get(sd, 0) + 1
-
-    def score(r):
-        try:
-            return int(r["Lead Score"] or 0)
-        except ValueError:
-            return 0
-
-    new_pool = sorted([r for r in out_rows if r["Status"] == "new"],
-                      key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
-    max_per_run = PER_SENDER_PER_RUN * len(senders)   # poori run ki HARD limit
+    # ---- 6) quota + sending ----
     total_sent = 0
+    if not paused:
+        window_start = now - timedelta(minutes=QUOTA_WINDOW_MINUTES)
+        day_start = now - timedelta(hours=24)
+        recent, daily = {}, {}
+        for r in out_rows:
+            t, sd = parse_iso(r["Last Sent"]), r["Sender"].lower()
+            if sd and t:
+                if t > window_start:
+                    recent[sd] = recent.get(sd, 0) + 1
+                if t > day_start:
+                    daily[sd] = daily.get(sd, 0) + 1
 
-    for s in senders:
-        if total_sent >= max_per_run:
-            break
-        quota = min(PER_SENDER_PER_RUN - recent.get(s["email"], 0),
-                    DAILY_MAX_PER_SENDER - daily.get(s["email"], 0))
-        if quota <= 0:
-            log.info("%s: quota pura, skip.", s["email"])
-            continue
+        def score(r):
+            try:
+                return int(r["Lead Score"] or 0)
+            except ValueError:
+                return 0
 
-        due = sorted(
-            [r for r in out_rows if r["Status"] == "active" and r["Sender"].lower() == s["email"]
-             and r["Stage"] in ("1", "2") and (parse_iso(r["Next Due"]) or now) <= now],
-            key=lambda r: r["Next Due"],
-        )
-        batch = due[:quota]
-        while len(batch) < quota and new_pool:
-            batch.append(new_pool.pop(0))
+        new_pool = sorted([r for r in out_rows if r["Status"] == "new"],
+                          key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
+        max_per_run = PER_SENDER_PER_RUN * len(senders)   # poori run ki HARD limit
 
-        for n, r in enumerate(batch):
+        for s in senders:
             if total_sent >= max_per_run:
                 break
-            email = r["Email"].lower()
-            stage = int(r["Stage"] or 0)
-            lead = lead_by_email.get(email, {"Store Name": r["Store Name"], "Domain": r["Domain"]})
-            subject, body = build_message(lead, stage, base_subject=r["Subject"] or None)
-
-            if DRY_RUN:
-                log.info("[DRY RUN] %s -> %s (email %s/3)\nSubject: %s\n%s\n%s",
-                         s["email"], email, stage + 1, subject, body, "-" * 60)
+            quota = min(PER_SENDER_PER_RUN - recent.get(s["email"], 0),
+                        DAILY_MAX_PER_SENDER - daily.get(s["email"], 0))
+            if quota <= 0:
+                log.info("%s: quota pura, skip.", s["email"])
                 continue
 
-            # PEHLE sheet me "sending" reserve karo — save na ho to email bheji hi nahi jayegi
-            # (crash/error ki soorat me ek email dobara nahi, kam az kam ek baar se zyada kabhi nahi)
-            prev_status, prev_last, prev_sender = r["Status"], r["Last Sent"], r["Sender"]
-            r["Status"], r["Last Sent"], r["Sender"] = "sending", iso(utcnow()), s["email"]
-            if not update_row(out_ws, r):
-                r["Status"], r["Last Sent"], r["Sender"] = prev_status, prev_last, prev_sender
-                log.error("Sheet me reserve save nahi hua — sending ROK di (duplicate se bachne ke liye).")
-                return
+            due = sorted(
+                [r for r in out_rows if r["Status"] == "active" and r["Sender"].lower() == s["email"]
+                 and r["Stage"] in ("1", "2", 1, 2) and (parse_iso(r["Next Due"]) or now) <= now],
+                key=lambda r: r["Next Due"],
+            )
+            batch = due[:quota]
+            while len(batch) < quota and new_pool:
+                batch.append(new_pool.pop(0))
 
-            def rollback():
-                r["Status"], r["Last Sent"], r["Sender"] = prev_status, prev_last, prev_sender
+            for n, r in enumerate(batch):
+                if total_sent >= max_per_run:
+                    break
+                email = r["Email"].lower()
+                stage = to_int(r["Stage"])
+                lead = lead_by_email.get(email, {"Store Name": r["Store Name"], "Domain": r["Domain"]})
+                tid = r.get("Track ID") or make_tid(email)
+                link = None
+                if track_url:
+                    base = track_url if "?" in track_url else track_url.rstrip("/") + "/"
+                    link = base + ("&" if "?" in base else "?") + "t=" + tid
+                subject, body = build_message(lead, stage, base_subject=r["Subject"] or None, link=link)
+
+                if DRY_RUN:
+                    log.info("[DRY RUN] %s -> %s (email %s/3)\nSubject: %s\n%s\n%s",
+                             s["email"], email, stage + 1, subject, body, "-" * 60)
+                    continue
+
+                # PEHLE sheet me "sending" reserve karo — save na ho to email bheji hi nahi jayegi
+                prev = {k: r.get(k, "") for k in ("Status", "Last Sent", "Sender", "Track ID")}
+                r["Status"], r["Last Sent"], r["Sender"], r["Track ID"] = "sending", iso(utcnow()), s["email"], tid
+                if not update_row(out_ws, r):
+                    r.update(prev)
+                    log.error("Sheet me reserve save nahi hua — sending ROK di (duplicate se bachne ke liye).")
+                    total_sent = -1
+                    break
+
+                def rollback():
+                    r.update(prev)
+                    update_row(out_ws, r)
+
+                try:
+                    mid = smtp_send(s, email, subject, body,
+                                    in_reply_to=r["Message-ID"] if (stage > 0 and r["Message-ID"]) else None)
+                except smtplib.SMTPAuthenticationError as e:
+                    log.error("%s: login fail (%s) — is account ko skip kar raha hun.", s["email"], e)
+                    rollback()
+                    break
+                except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as e:
+                    r["Status"], r["Notes"] = "bounced", f"SMTP refused: {str(e)[:120]}"
+                    derive(r)
+                    update_row(out_ws, r)
+                    continue
+                except Exception as e:
+                    log.error("Send fail %s -> %s: %s", s["email"], email, e)
+                    rollback()
+                    continue
+
+                r["Stage"] = stage + 1
+                if stage == 0:
+                    r["Message-ID"], r["Subject"], r["Status"] = mid, subject, "active"
+                    r["First Sent"] = iso(utcnow())
+                    r["Next Due"] = iso(utcnow() + timedelta(days=FU1_DAYS))
+                elif stage == 1:
+                    r["Status"] = "active"
+                    r["Next Due"] = iso(utcnow() + timedelta(days=FU2_DAYS))
+                else:
+                    r["Next Due"], r["Status"] = "", "done"
+                derive(r)
                 update_row(out_ws, r)
-
-            try:
-                mid = smtp_send(s, email, subject, body, in_reply_to=r["Message-ID"] if (stage > 0 and r["Message-ID"]) else None)
-            except smtplib.SMTPAuthenticationError as e:
-                log.error("%s: login fail (%s) — is account ko skip kar raha hun.", s["email"], e)
-                rollback()
+                total_sent += 1
+                log.info("SENT %s -> %s (email %s/3) [%s/%s is run me]", s["email"], email, stage + 1, total_sent, max_per_run)
+                if n < len(batch) - 1:
+                    time.sleep(random.randint(*SEND_GAP))
+            if total_sent < 0:
+                total_sent = 0
                 break
-            except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as e:
-                r["Status"], r["Notes"] = "bounced", f"SMTP refused: {str(e)[:120]}"
-                update_row(out_ws, r)
-                continue
-            except Exception as e:
-                log.error("Send fail %s -> %s: %s", s["email"], email, e)
-                rollback()
-                continue
 
-            r["Stage"] = stage + 1
-            if stage == 0:
-                r["Message-ID"], r["Subject"], r["Status"] = mid, subject, "active"
-                r["Next Due"] = iso(utcnow() + timedelta(days=FU1_DAYS))
-            elif stage == 1:
-                r["Status"] = "active"
-                r["Next Due"] = iso(utcnow() + timedelta(days=FU2_DAYS))
-            else:
-                r["Next Due"], r["Status"] = "", "done"
-            update_row(out_ws, r)
-            total_sent += 1
-            log.info("SENT %s -> %s (email %s/3) [%s/%s is run me]", s["email"], email, stage + 1, total_sent, max_per_run)
-            if n < len(batch) - 1:
-                time.sleep(random.randint(*SEND_GAP))
+    # ---- 7) Dashboard + Replies tab ----
+    sent24 = 0
+    for r in out_rows:
+        t = parse_iso(r["Last Sent"])
+        if t and t > now - timedelta(hours=24):
+            sent24 += 1
+    write_dashboard(T["dashboard"], senders, sent24, now)
+    write_replies_tab(T["replies"], out_rows)
 
     counts = {}
     for r in out_rows:
         counts[r["Status"]] = counts.get(r["Status"], 0) + 1
-    log.info("===== DONE ===== is run me bheji: %s | status summary: %s", total_sent, counts)
+    replies = sum(1 for r in out_rows if r.get("Replied") == "Yes")
+    log.info("===== DONE ===== is run me bheji: %s | replies: %s | status summary: %s", total_sent, replies, counts)
 
 
 if __name__ == "__main__":
