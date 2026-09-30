@@ -1,7 +1,7 @@
 name: Hourly Email Sender
 on:
   schedule:
-    - cron: '0 * * * *'   # har ghante
+    - cron: '23,53 * * * *'  # har ghante 2 baar (23 aur 53 minute par)
   workflow_dispatch:       # manual "Run workflow" button
 
 concurrency:
@@ -26,7 +26,7 @@ jobs:
       - name: Run email sender script
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}      # NAYI lead-finder sheet
-          SEND_MODE: ${{ vars.SEND_MODE || 'dry' }}            # 'dry' = test, 'live' = asli emails
+          SEND_MODE: live                                      # 'live' = asli emails | 'dry' = sirf test
           PHYSICAL_ADDRESS: ${{ vars.PHYSICAL_ADDRESS }}       # optional (footer)
           GMAIL_1_ADDRESS: ${{ secrets.GMAIL_1_ADDRESS }}
           GMAIL_1_APPPASS: ${{ secrets.GMAIL_1_APPPASS }}
