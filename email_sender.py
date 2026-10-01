@@ -59,7 +59,7 @@ QUOTA_WINDOW_MINUTES = int(os.environ.get("QUOTA_WINDOW_MINUTES", "45"))
 FU1_DAYS = float(os.environ.get("FOLLOWUP1_DAYS", "3"))
 FU2_DAYS = float(os.environ.get("FOLLOWUP2_DAYS", "4"))
 MIGRATED_FU_DELAY_DAYS = float(os.environ.get("MIGRATED_FU_DELAY_DAYS", "2"))
-MIN_QUALITY = os.environ.get("MIN_QUALITY", "GOOD").upper()
+MIN_QUALITY = os.environ.get("MIN_QUALITY", "LOW").upper()
 SEND_MODE_RAW = os.environ.get("SEND_MODE", "")
 DRY_RUN = SEND_MODE_RAW.strip().lower() not in ("live", "1", "true", "yes", "on")
 SEND_GAP = (int(os.environ.get("SEND_GAP_MIN", "10")), int(os.environ.get("SEND_GAP_MAX", "40")))
@@ -70,6 +70,24 @@ BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "40"))           # i
 BOUNCE_MIN_COUNT = int(os.environ.get("BOUNCE_MIN_COUNT", "3"))              # aur kam az kam itne bounce
 
 QUALITY_RANK = {"LOW": 0, "GOOD": 1, "WARM": 2, "HOT": 3}
+HARD_MAX_PER_SENDER_PER_RUN = 5      # Control tab se bhi isse zyada nahi
+HARD_MAX_DAILY_PER_SENDER = 60
+
+# ---- multi-account (v4): providers, ramp-up, per-account health ----
+PROVIDERS = {
+    "gmail":   {"smtp_host": "smtp.gmail.com",     "smtp_port": 465, "imap_host": "imap.gmail.com"},
+    "zoho":    {"smtp_host": "smtp.zoho.com",      "smtp_port": 465, "imap_host": "imap.zoho.com"},
+    "outlook": {"smtp_host": "smtp.office365.com", "smtp_port": 587, "imap_host": "outlook.office365.com"},
+}
+SENDER_HEADERS = ["Email", "Provider", "Name", "Status", "Start Date", "Daily Limit Override", "Age (days)",
+                  "Daily Limit Today", "Sent 24h", "Sent 7d", "Replies (all)", "Bounced 7d", "Bounce Rate 7d",
+                  "Reply Rate", "Notes"]
+DEFAULT_RAMP = "5,10,15,20,25,30"            # har hafte ki daily limit (naye account ke liye), aakhri value aage chalti hai
+ACCOUNT_BOUNCE_RATIO = float(os.environ.get("ACCOUNT_BOUNCE_RATIO", "0.06"))
+ACCOUNT_BOUNCE_MIN_SENT = int(os.environ.get("ACCOUNT_BOUNCE_MIN_SENT", "20"))
+ACCOUNT_BOUNCE_MIN_COUNT = int(os.environ.get("ACCOUNT_BOUNCE_MIN_COUNT", "3"))
+GLOBAL_MAX_PER_RUN = int(os.environ.get("GLOBAL_MAX_PER_RUN", "500"))
+ESTABLISHED_AGE_DAYS = 28                    # purane (GMAIL_n) accounts ko "warmed" maana jata hai
 
 # Purani (non Online Store 2.0) themes — inme app sections nahi chalte, isliye skip
 LEGACY_THEMES = {
@@ -192,6 +210,42 @@ def email_problem(email):
     return ""
 
 
+REAL_COM_TLDS = {"community", "computer", "commbank", "comcast", "compare", "comsec"}
+
+
+def repair_email(e):
+    """Glued/ganda addresses theek karna: '%20info@x.com', 'u003ehello@x.com', 'info@x.comif' -> 'info@x.com'."""
+    e = (e or "").strip().lower()
+    e = re.sub(r"^(%20|u003e|u003c)+", "", e)
+    if e.count("@") == 1:
+        local, dom = e.split("@")
+        parts = dom.split(".")
+        tld = parts[-1]
+        if len(tld) > 3 and tld not in GOOD_TLDS and tld not in REAL_COM_TLDS and tld.startswith("com"):
+            parts[-1] = "com"
+        e = local + "@" + ".".join(parts)
+    return e
+
+
+def candidate_emails(lead):
+    c = [lead.get("Email", "")] + [x.strip() for x in (lead.get("Other Emails", "") or "").split(",")]
+    return [x.lower() for x in c if x and "@" in x]
+
+
+def pick_email(lead, known, unsub, first=None):
+    """Lead ki sab emails (primary + Other Emails, repaired) me se pehli jo theek ho aur pehle se list me na ho."""
+    cands = []
+    for e in ([first.lower()] if first else []) + candidate_emails(lead):
+        for v in (e, repair_email(e)):
+            if v not in cands:
+                cands.append(v)
+    for e in cands:
+        if e in known or email_problem(e) or is_unsub(e, unsub):
+            continue
+        return e
+    return None
+
+
 EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
 STOP_RE = re.compile(r"\b(stop|unsubscribe|remove me|remove us|not interested|don'?t email|do not email|opt out)\b", re.I)
 
@@ -259,6 +313,7 @@ def connect():
         "replies": tab("Replies", ["Store Name", "Email", "Domain", "Quality", "Replied At", "Reply Snippet",
                                    "Emails Sent", "Sender", "Status"]),
         "dashboard": tab("Dashboard", ["Metric", "Value"]),
+        "senders": tab("Senders", SENDER_HEADERS),
         "clicks": clicks,
     }
 
@@ -391,25 +446,31 @@ def migrate_old_sheet(gc, out_ws, out_rows, senders, unsub):
 # ============================================================
 # LEADS -> OUTREACH SYNC
 # ============================================================
-def sync_leads(leads_rows, out_ws, out_rows, unsub):
+def sync_leads(leads_rows, out_ws, out_rows, unsub, min_quality="LOW", include_legacy=False):
     known = {r["Email"].lower() for r in out_rows}
+    alt_domains = {r["Domain"].lower() for r in out_rows if r.get("Notes", "").startswith("alt email")}
     new_rows = []
     for lead in leads_rows:
-        email = lead.get("Email", "").lower()
-        if not email or "@" not in email or email in known:
+        primary = lead.get("Email", "").lower()
+        if not primary or "@" not in primary or primary in known or lead.get("Domain", "").lower() in alt_domains:
             continue
-        known.add(email)
         quality = lead.get("Quality", "LOW").upper()
+        chosen = pick_email(lead, known, unsub)
+        email = chosen or primary
+        known.add(email)
         status, note = "new", ""
-        bad = email_problem(email)
-        if bad:
-            status, note = "skipped", f"bad email: {bad}"
-        elif QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(MIN_QUALITY, 1):
-            status, note = "skipped", f"quality {quality} < {MIN_QUALITY}"
-        elif lead.get("Theme", "").strip().lower() in LEGACY_THEMES:
+        if chosen and chosen != primary:
+            note = f"alt email used (primary was: {primary})"
+        if not chosen:
+            bad = email_problem(primary)
+            if bad:
+                status, note = "skipped", f"bad email: {bad}"
+            elif is_unsub(primary, unsub):
+                status, note = "unsub", "in Unsubscribed tab"
+        if status == "new" and QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(min_quality, 0):
+            status, note = "skipped", f"quality {quality} < {min_quality}"
+        elif status == "new" and not include_legacy and lead.get("Theme", "").strip().lower() in LEGACY_THEMES:
             status, note = "skipped", "legacy theme (no OS2.0 sections)"
-        elif is_unsub(email, unsub):
-            status, note = "unsub", "in Unsubscribed tab"
         new_rows.append(make_row({
             "Email": email, "Store Name": lead.get("Store Name", ""), "Domain": lead.get("Domain", ""),
             "Quality": quality, "Lead Score": lead.get("Lead Score", "0"), "Status": status, "Stage": 0,
@@ -418,6 +479,36 @@ def sync_leads(leads_rows, out_ws, out_rows, unsub):
     append_in_chunks(out_ws, new_rows)
     if new_rows:
         log.info("Outreach tab me %s naye leads add hue.", len(new_rows))
+
+
+def reconsider_skipped(out_rows, lead_by_email, lead_by_domain, unsub, min_quality, include_legacy):
+    """Pehle skip hui rows (jinhe kabhi mail nahi gayi) dobara dekhta hai: setting dheeli hui to wapas queue me;
+    bad/role email ho to Other Emails ya repaired address se."""
+    known = {r["Email"].lower() for r in out_rows}
+    back = fixed = 0
+    for r in out_rows:
+        if r["Status"] != "skipped" or to_int(r["Stage"]) > 0:
+            continue
+        note = r.get("Notes", "")
+        if note.startswith("quality "):
+            if QUALITY_RANK.get(r["Quality"].upper(), 0) >= QUALITY_RANK.get(min_quality, 0):
+                r["Status"], r["Notes"] = "new", ""
+                back += 1
+        elif note.startswith("legacy theme"):
+            if include_legacy:
+                r["Status"], r["Notes"] = "new", ""
+                back += 1
+        elif note.startswith("bad email"):
+            old = r["Email"].lower()
+            lead = lead_by_email.get(old) or lead_by_domain.get((r.get("Domain") or "").lower()) or {"Email": old}
+            new = pick_email(lead, known, unsub, first=old)
+            if new and new != old:
+                r["Email"], r["Status"], r["Notes"] = new, "new", f"alt email used (was: {old})"
+                r["_email_dirty"] = True
+                known.add(new)
+                fixed += 1
+    if back or fixed:
+        log.info("Pehle skip hui rows wapas queue me: %s (setting ki wajah se) | %s (email theek/alternate mil gayi).", back, fixed)
 
 
 # ============================================================
@@ -552,12 +643,36 @@ def build_message(lead, stage, base_subject=None, link=None):
 # SMTP / IMAP
 # ============================================================
 def load_senders():
-    senders = []
+    """Accounts: SENDERS_JSON secret (kitne bhi) + purane GMAIL_n_ADDRESS/GMAIL_n_APPPASS (1..20)."""
+    senders, seen = [], set()
+    raw = os.environ.get("SENDERS_JSON", "").strip()
+    if raw:
+        try:
+            items = json.loads(raw)
+        except Exception as e:
+            log.error("SENDERS_JSON valid JSON nahi (%s) — sirf GMAIL_n accounts chalenge.", e)
+            items = []
+        for it in items:
+            email = (it.get("email") or "").strip().lower()
+            pw = (it.get("password") or it.get("app_password") or "").strip()
+            if not email or not pw or email in seen:
+                continue
+            prov = (it.get("provider") or "gmail").strip().lower()
+            cfg = dict(PROVIDERS.get(prov, PROVIDERS["gmail"]))
+            for k in ("smtp_host", "smtp_port", "imap_host"):
+                if it.get(k):
+                    cfg[k] = it[k]
+            senders.append({"email": email, "password": pw, "name": it.get("name") or FROM_NAME, "provider": prov,
+                            "established": bool(it.get("warmed")), "start_date": (it.get("start_date") or "").strip(),
+                            **cfg})
+            seen.add(email)
     for i in range(1, 21):
-        addr = os.environ.get(f"GMAIL_{i}_ADDRESS", "").strip()
+        addr = os.environ.get(f"GMAIL_{i}_ADDRESS", "").strip().lower()
         pw = os.environ.get(f"GMAIL_{i}_APPPASS", "").strip()
-        if addr and pw:
-            senders.append({"email": addr.lower(), "password": pw, "name": FROM_NAME})
+        if addr and pw and addr not in seen:
+            senders.append({"email": addr, "password": pw, "name": FROM_NAME, "provider": "gmail",
+                            "established": True, "start_date": "", **PROVIDERS["gmail"]})
+            seen.add(addr)
     return senders
 
 
@@ -574,9 +689,21 @@ def smtp_send(sender, to_email, subject, body, in_reply_to=None):
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = in_reply_to
     msg.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as server:
+    ctx = ssl.create_default_context()
+    port = int(sender["smtp_port"])
+    if port == 465:
+        server = smtplib.SMTP_SSL(sender["smtp_host"], port, context=ctx, timeout=30)
+    else:
+        server = smtplib.SMTP(sender["smtp_host"], port, timeout=30)
+        server.starttls(context=ctx)
+    try:
         server.login(sender["email"], sender["password"])
         server.send_message(msg)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
     return mid
 
 
@@ -638,7 +765,7 @@ def check_inbox(sender, tracked):
         if not is_free(d):
             domain_map.setdefault(d, e)
     try:
-        M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
+        M = imaplib.IMAP4_SSL(sender["imap_host"], timeout=30)
         M.login(sender["email"], sender["password"])
         M.select("INBOX", readonly=True)
         since = (utcnow() - timedelta(days=IMAP_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
@@ -688,6 +815,61 @@ def check_inbox(sender, tracked):
     except Exception as e:
         log.warning("IMAP check fail (%s): %s", sender["email"], e)
     return events
+
+
+def sent_folder_has(sender, to_email, since_dt):
+    """Sent folder me dekhta hai ke is address ko mail gayi thi ya nahi. True/False, ya None (check na ho saka)."""
+    try:
+        M = imaplib.IMAP4_SSL(sender.get("imap_host", "imap.gmail.com"), timeout=30)
+        M.login(sender["email"], sender["password"])
+        for folder in ('"[Gmail]/Sent Mail"', "Sent", '"Sent Items"'):
+            typ, _ = M.select(folder, readonly=True)
+            if typ == "OK":
+                break
+        _, data = M.search(None, "SINCE", since_dt.strftime("%d-%b-%Y"), "TO", f'"{to_email}"')
+        found = bool(data and data[0].split())
+        M.logout()
+        return found
+    except Exception as e:
+        log.warning("Sent folder check fail (%s): %s", sender["email"], e)
+        return None
+
+
+def recover_stuck(out_rows, senders, now):
+    """Run bheech me cancel/crash ho jaye to 'sending' me atki rows ko Sent folder se check karke theek karta hai,
+    taake koi lead chupke se rah na jaye (aur double mail bhi na jaye)."""
+    by_email = {s["email"]: s for s in senders}
+    fixed = 0
+    for r in out_rows:
+        if r["Status"] != "sending":
+            continue
+        t = parse_iso(r["Last Sent"])
+        if t and now - t < timedelta(minutes=30):
+            continue
+        s = by_email.get(r["Sender"].lower())
+        if not s or fixed >= 20:
+            continue
+        found = sent_folder_has(s, r["Email"], (t or now) - timedelta(days=1))
+        if found is None:
+            continue
+        stage = to_int(r["Stage"])
+        if found:
+            r["Stage"] = stage + 1
+            if stage == 0:
+                r["Status"], r["First Sent"] = "active", r["Last Sent"]
+                r["Next Due"] = iso(now + timedelta(days=FU1_DAYS))
+            elif stage == 1:
+                r["Status"], r["Next Due"] = "active", iso(now + timedelta(days=FU2_DAYS))
+            else:
+                r["Status"], r["Next Due"] = "done", ""
+            r["Notes"] = "recovered: mail Sent folder me mili"
+        else:
+            r["Status"] = "new" if stage == 0 else "active"
+            if stage == 0:
+                r["Last Sent"] = ""
+            r["Notes"] = "recovered: mail nahi gayi thi, dobara try hogi"
+        fixed += 1
+        log.info("%s: atki 'sending' row theek ki -> %s", r["Email"], r["Status"])
 
 
 def apply_events(tracked, events, now):
@@ -802,6 +984,9 @@ def write_dashboard(ws, senders, sent24, now, waiting=0, per_day=0):
         ["Total clicks", f"=SUM({O}!W2:W)"],                                         # 20
         ["Max sending speed (emails/day, all accounts)", per_day],                   # 21
         ["Estimated days to email all waiting leads", round(waiting / per_day) if per_day else "-"],  # 22
+        ["Skipped: bad/junk email (nothing deliverable)", f'=COUNTIFS({O}!F2:F,"skipped",{O}!M2:M,"bad email*")'],
+        ["Skipped: quality filter", f'=COUNTIFS({O}!F2:F,"skipped",{O}!M2:M,"quality*")'],
+        ["Skipped: old theme (app unsupported)", f'=COUNTIFS({O}!F2:F,"skipped",{O}!M2:M,"legacy theme*")'],
         ["", ""],
         ["BY SENDER", "Stores emailed", "Replies", "Reply rate", "Bounced"],         # 22
     ]
@@ -855,6 +1040,139 @@ def write_replies_tab(ws, rows):
 LIVE_VALUES = ("live", "1", "true", "yes", "on")
 
 
+def parse_ramp(txt):
+    vals = [int(x) for x in re.findall(r"\d+", txt or "")]
+    return vals or [int(x) for x in DEFAULT_RAMP.split(",")]
+
+
+def parse_hours(txt):
+    """'all' ya '13-23' (UTC ghante, inclusive; '22-4' bhi chalta hai) -> list of hours."""
+    t = (txt or "all").strip().lower()
+    m = re.match(r"^(\d{1,2})\s*-\s*(\d{1,2})$", t)
+    if not m:
+        return list(range(24))
+    a, b = int(m.group(1)) % 24, int(m.group(2)) % 24
+    hours, h = [a], a
+    while h != b:
+        h = (h + 1) % 24
+        hours.append(h)
+    return hours
+
+
+def slots_for_hour(limit, hours, hour):
+    """Daily limit ko send-window ke ghanton me barabar baantna (jaise 30/din = 1,2,1,2 ... har ghante)."""
+    if hour not in hours:
+        return 0
+    k, w = hours.index(hour), len(hours)
+    return (limit * (k + 1)) // w - (limit * k) // w
+
+
+def daily_limit_for(info, ramp, cap, hard_cap, now):
+    try:
+        start = datetime.strptime(info["start"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        age = max(0, (now - start).days)
+    except Exception:
+        age = 0
+    base = ramp[min(age // 7, len(ramp) - 1)]
+    override = to_int(info.get("override"))
+    if override > 0:
+        base = override
+    return max(0, min(base, cap, hard_cap))
+
+
+def sync_senders_tab(ws, senders, now):
+    """Senders tab me har account ki ek row (naye accounts khud add). User Status/Start Date/Override badal sakta hai."""
+    rows = {r["Email"].lower(): r for r in sheet_rows(ws) if r.get("Email")}
+    new_rows = []
+    for s in senders:
+        if s["email"] in rows:
+            continue
+        if s.get("start_date"):
+            start = s["start_date"]
+        elif s.get("established"):
+            start = (now - timedelta(days=ESTABLISHED_AGE_DAYS)).strftime("%Y-%m-%d")
+        else:
+            start = now.strftime("%Y-%m-%d")
+        new_rows.append([s["email"], s["provider"], s["name"], "active", start, "", "", "", "", "", "", "", "", "",
+                         "new account - ramp-up shuru" if not s.get("established") else "established account"])
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW")
+        log.info("Senders tab me %s naye accounts add hue.", len(new_rows))
+        rows = {r["Email"].lower(): r for r in sheet_rows(ws) if r.get("Email")}
+    info = {}
+    for s in senders:
+        r = rows.get(s["email"])
+        if r:
+            info[s["email"]] = {"status": (r.get("Status") or "active").strip().lower(), "start": r.get("Start Date", ""),
+                                "override": r.get("Daily Limit Override", ""), "notes": r.get("Notes", ""),
+                                "_row": r["_row"]}
+    return info
+
+
+def sender_stats(out_rows, now):
+    st = {}
+    d1, d7 = now - timedelta(hours=24), now - timedelta(days=7)
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    for r in out_rows:
+        sd = r["Sender"].lower()
+        if not sd:
+            continue
+        x = st.setdefault(sd, {"s24": 0, "s7": 0, "b7": 0, "replies": 0, "emailed": 0, "hour": 0})
+        if to_int(r["Stage"]) > 0:
+            x["emailed"] += 1
+        if r.get("Replied") == "Yes":
+            x["replies"] += 1
+        t = parse_iso(r["Last Sent"])
+        if t:
+            if t > d1:
+                x["s24"] += 1
+            if t >= hour_start:
+                x["hour"] += 1
+            if t > d7:
+                x["s7"] += 1
+                if r["Status"] == "bounced":
+                    x["b7"] += 1
+    return st
+
+
+def apply_account_health(senders, sinfo, stats, now):
+    """Kisi account ka bounce rate zyada ho to sirf wahi 48 ghante ke liye pause; pause khatam to auto resume."""
+    for s in senders:
+        i, x = sinfo[s["email"]], stats.get(s["email"], {})
+        if i["status"] == "paused":
+            m = re.search(r"paused until (\S+)", i["notes"])
+            until = parse_iso(m.group(1)) if m else None
+            if until and until <= now:
+                i["status"], i["notes"] = "active", "auto-resumed after pause"
+                log.info("%s: pause khatam, wapas active.", s["email"])
+        elif i["status"] == "active":
+            s7, b7 = x.get("s7", 0), x.get("b7", 0)
+            if s7 >= ACCOUNT_BOUNCE_MIN_SENT and b7 >= ACCOUNT_BOUNCE_MIN_COUNT and b7 / s7 > ACCOUNT_BOUNCE_RATIO:
+                i["status"] = "paused"
+                i["notes"] = f"paused until {iso(now + timedelta(hours=48))} (bounce {100 * b7 / s7:.0f}% of {s7})"
+                log.error("%s: bounce rate %s/%s — account 48 ghante ke liye pause.", s["email"], b7, s7)
+
+
+def write_senders_tab(ws, senders, sinfo, stats, limits, now):
+    payload = []
+    for s in senders:
+        i, x = sinfo[s["email"]], stats.get(s["email"], {})
+        try:
+            age = (now.date() - datetime.strptime(i["start"], "%Y-%m-%d").date()).days
+        except Exception:
+            age = ""
+        s7, b7, em = x.get("s7", 0), x.get("b7", 0), x.get("emailed", 0)
+        payload.append({"range": f"A{i['_row']}:O{i['_row']}", "values": [[
+            s["email"], s["provider"], s["name"], i["status"], i["start"], i["override"], age,
+            limits.get(s["email"], 0), x.get("s24", 0), s7, x.get("replies", 0), b7,
+            f"{100 * b7 / s7:.1f}%" if s7 else "", f"{100 * x.get('replies', 0) / em:.1f}%" if em else "", i["notes"]]]})
+    try:
+        for k in range(0, len(payload), 200):
+            ws.batch_update(payload[k:k + 200], value_input_option="RAW")
+    except Exception as e:
+        log.warning("Senders tab update fail: %s", e)
+
+
 def order_pool(pool, priority, score):
     """Naye leads kis tarteeb se bheje jayen. score = best leads pehle | random | newest | oldest."""
     if priority == "random":
@@ -881,6 +1199,10 @@ def read_settings(control_ws):
         ("PER_SENDER_PER_RUN", str(PER_SENDER_PER_RUN)),
         ("DAILY_MAX_PER_SENDER", str(DAILY_MAX_PER_SENDER)),
         ("PRIORITY", "score"),
+        ("RAMP_SCHEDULE", DEFAULT_RAMP),
+        ("SEND_HOURS_UTC", "all"),
+        ("MIN_QUALITY", MIN_QUALITY),
+        ("INCLUDE_LEGACY_THEMES", "no"),
     ]
     added = False
     for key, val in defaults:
@@ -892,7 +1214,9 @@ def read_settings(control_ws):
         control_ws.append_row([
             "(note)",
             "SEND_MODE: live/dry/stop | TRACK_URL: click tracking link (khali=band) | PER_SENDER_PER_RUN: har account har run "
-            "(max 5) | DAILY_MAX_PER_SENDER: har account 24h me (max 60) | PRIORITY: score / random / newest / oldest"],
+            "(max 5) | DAILY_MAX_PER_SENDER: har account ki upar ki hadd (max 60) | PRIORITY: score / random / newest / oldest | "
+            "RAMP_SCHEDULE: naye account ki har hafte ki daily limit | SEND_HOURS_UTC: 'all' ya '13-23' | "
+            "MIN_QUALITY: LOW (sab) / GOOD / WARM / HOT | INCLUDE_LEGACY_THEMES: yes/no"],
             value_input_option="RAW")
     return settings
 
@@ -927,11 +1251,15 @@ def run_once():
     per_sender = min(5, max(1, to_int(settings.get("PER_SENDER_PER_RUN")) or PER_SENDER_PER_RUN))
     daily_max = min(60, max(1, to_int(settings.get("DAILY_MAX_PER_SENDER")) or DAILY_MAX_PER_SENDER))
     priority = (settings.get("PRIORITY") or "score").strip().lower()
+    min_quality = (settings.get("MIN_QUALITY") or MIN_QUALITY).strip().upper()
+    if min_quality not in QUALITY_RANK:
+        min_quality = "LOW"
+    include_legacy = (settings.get("INCLUDE_LEGACY_THEMES") or "no").strip().lower() in LIVE_VALUES
     log.info("FINAL MODE: %s | GitHub env SEND_MODE=%r | Sheet 'Control' tab SEND_MODE=%r | click tracking: %s",
              "DRY RUN (koi email nahi jayegi)" if DRY_RUN else "LIVE (asli emails)", SEND_MODE_RAW, sheet_val,
              "ON" if track_url else "OFF")
-    log.info("Settings: har account har run %s mails | 24h me max %s | naye leads ki tarteeb: %s",
-             per_sender, daily_max, priority)
+    log.info("Settings: har account har run %s mails | 24h me max %s | tarteeb: %s | min quality: %s | purani themes: %s",
+             per_sender, daily_max, priority, min_quality, "shamil" if include_legacy else "nahi")
     log.info("SPEED: har account %s mail/run, max %s/din | %s accounts => max %s mails/din",
              PER_SENDER_PER_RUN, DAILY_MAX_PER_SENDER, len(senders),
              len(senders) * min(PER_SENDER_PER_RUN * 24, DAILY_MAX_PER_SENDER))
@@ -942,13 +1270,18 @@ def run_once():
     out_rows = sheet_rows(out_ws)
 
     leads_rows = sheet_rows(leads_ws)
-    sync_leads(leads_rows, out_ws, out_rows, unsub)
+    sync_leads(leads_rows, out_ws, out_rows, unsub, min_quality, include_legacy)
     out_rows = sheet_rows(out_ws)
     lead_by_email = {l["Email"].lower(): l for l in leads_rows if l.get("Email")}
+    lead_by_domain = {l["Domain"].lower(): l for l in leads_rows if l.get("Domain")}
     now = utcnow()
     log.info("Leads tab: %s rows | Outreach tab: %s rows", len(leads_rows), len(out_rows))
 
     original = {r["_row"]: sig(r) for r in out_rows}   # is run ke shuru ki haalat (kya badla, ye dekhne ke liye)
+
+    # ---- 0) skip hui rows dobara dekho + atki 'sending' rows theek karo ----
+    reconsider_skipped(out_rows, lead_by_email, lead_by_domain, unsub, min_quality, include_legacy)
+    recover_stuck(out_rows, senders, now)
 
     # ---- 1) inbox: replies / auto-replies / bounces / unsubscribes ----
     tracked = {r["Email"].lower(): r for r in out_rows if to_int(r["Stage"]) > 0}
@@ -1003,6 +1336,13 @@ def run_once():
         batch_update_rows(out_ws, changed)
     if changed:
         log.info("Sheet me %s rows update hui.", len(changed))
+    dirty = [r for r in out_rows if r.get("_email_dirty")]
+    for i in range(0, len(dirty), 300):
+        try:
+            out_ws.batch_update([{"range": f"A{r['_row']}", "values": [[r["Email"]]]} for r in dirty[i:i + 300]],
+                                value_input_option="RAW")
+        except Exception as e:
+            log.warning("Email column update fail: %s", e)
     original = {r["_row"]: sig(r) for r in out_rows}
 
     # ---- 5) CIRCUIT BREAKER ----
@@ -1039,6 +1379,7 @@ def run_once():
         new_pool = order_pool([r for r in out_rows if r["Status"] == "new"], priority, score)
         log.info("Queue: %s naye leads intezar me (tarteeb: %s)", len(new_pool), priority)
         max_per_run = per_sender * len(senders)   # poori run ki HARD limit
+        known_senders = {x["email"] for x in senders}
 
         for s in senders:
             if total_sent >= max_per_run:
@@ -1050,7 +1391,8 @@ def run_once():
                 continue
 
             due = sorted(
-                [r for r in out_rows if r["Status"] == "active" and r["Sender"].lower() == s["email"]
+                [r for r in out_rows if r["Status"] == "active"
+                 and (r["Sender"].lower() == s["email"] or r["Sender"].lower() not in known_senders)
                  and r["Stage"] in ("1", "2", 1, 2) and (parse_iso(r["Next Due"]) or now) <= now],
                 key=lambda r: r["Next Due"],
             )
@@ -1063,7 +1405,8 @@ def run_once():
                     break
                 email = r["Email"].lower()
                 stage = to_int(r["Stage"])
-                lead = lead_by_email.get(email, {"Store Name": r["Store Name"], "Domain": r["Domain"]})
+                lead = (lead_by_email.get(email) or lead_by_domain.get((r["Domain"] or "").lower())
+                        or {"Store Name": r["Store Name"], "Domain": r["Domain"]})
                 tid = r.get("Track ID") or make_tid(email)
                 link = None
                 if track_url:
