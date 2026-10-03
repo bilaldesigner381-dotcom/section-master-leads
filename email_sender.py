@@ -67,7 +67,12 @@ IMAP_LOOKBACK_DAYS = int(os.environ.get("IMAP_LOOKBACK_DAYS", "30"))
 DAILY_MAX_PER_SENDER = int(os.environ.get("DAILY_MAX_PER_SENDER", "48"))   # 24 ghante me har account ki hard limit
 BOUNCE_PAUSE_RATIO = float(os.environ.get("BOUNCE_PAUSE_RATIO", "0.06"))     # bounce rate is se zyada => sending band
 BOUNCE_MIN_SAMPLE = int(os.environ.get("BOUNCE_MIN_SAMPLE", "40"))           # itni mails ke baad hi rate par faisla
-BOUNCE_MIN_COUNT = int(os.environ.get("BOUNCE_MIN_COUNT", "3"))              # aur kam az kam itne bounce
+BOUNCE_MIN_COUNT = int(os.environ.get("BOUNCE_MIN_COUNT", "3"))
+# --- har Gmail ka apna breaker: jis account par bounce zyada, sirf wahi REST_HOURS ke liye ruke ---
+SENDER_PAUSE_RATIO = float(os.environ.get("SENDER_PAUSE_RATIO", "0.10"))     # us account ki bounce rate is se zyada
+SENDER_MIN_SAMPLE = int(os.environ.get("SENDER_MIN_SAMPLE", "20"))           # kam az kam itne stores ko mail gayi ho
+SENDER_MIN_BOUNCES = int(os.environ.get("SENDER_MIN_BOUNCES", "3"))
+REST_HOURS = float(os.environ.get("REST_HOURS", "72"))              # aur kam az kam itne bounce
 
 QUALITY_RANK = {"LOW": 0, "GOOD": 1, "WARM": 2, "HOT": 3}
 HARD_MAX_PER_SENDER_PER_RUN = 5      # Control tab se bhi isse zyada nahi
@@ -1186,6 +1191,40 @@ def order_pool(pool, priority, score):
     return sorted(pool, key=lambda r: (-QUALITY_RANK.get(r["Quality"].upper(), 0), -score(r)))
 
 
+def set_setting(control_ws, key, value):
+    """Control tab me 'key | value' row update karo (na ho to nayi row)."""
+    try:
+        for i, row in enumerate(control_ws.get_all_values(), start=1):
+            if row and row[0].strip().upper() == key.upper():
+                control_ws.update(values=[[value]], range_name=f"B{i}", value_input_option="RAW")
+                return
+        control_ws.append_row([key, value], value_input_option="RAW")
+    except Exception as e:
+        log.warning("Control tab me '%s' save nahi hui: %s", key, e)
+
+
+def sender_breaker(out_rows, senders, settings, now):
+    """Har sender ka apna hisaab. Return (paused: {email: until_dt}, newly: [(email, bounced, total, until_dt)])."""
+    paused, newly = {}, []
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for s in senders:
+        until = parse_iso(settings.get("PAUSED_UNTIL " + s["email"].upper(), ""))
+        if until and until > now:
+            paused[s["email"]] = until            # abhi rest par
+            continue
+        rows = [r for r in out_rows if r["Sender"].lower() == s["email"]
+                and (to_int(r["Stage"]) > 0 or r["Status"] == "bounced")]
+        if until:                                   # pehle rest ho chuka: sirf rest ke BAAD ki mails ginein
+            rows = [r for r in rows if (parse_iso(r["Last Sent"]) or epoch) > until]
+        n, b = len(rows), sum(1 for r in rows if r["Status"] == "bounced")
+        log.info("Account %s: %s stores ko mail, %s bounce (%.1f%%)", s["email"], n, b, 100 * b / n if n else 0)
+        if n >= SENDER_MIN_SAMPLE and b >= SENDER_MIN_BOUNCES and b / n > SENDER_PAUSE_RATIO:
+            u = now + timedelta(hours=REST_HOURS)
+            paused[s["email"]] = u
+            newly.append((s["email"], b, n, u))
+    return paused, newly
+
+
 def read_settings(control_ws):
     """Control tab: 'Setting | Value' rows -> dict. Missing settings khud add ho jati hain (default value ke sath)."""
     settings, has_note = {}, False
@@ -1345,16 +1384,16 @@ def run_once():
             log.warning("Email column update fail: %s", e)
     original = {r["_row"]: sig(r) for r in out_rows}
 
-    # ---- 5) CIRCUIT BREAKER ----
-    since72 = now - timedelta(hours=72)
-    sent72 = [r for r in out_rows if (parse_iso(r["Last Sent"]) or since72) > since72]
-    bounced72 = [r for r in sent72 if r["Status"] == "bounced"]
-    paused = (len(sent72) >= BOUNCE_MIN_SAMPLE and len(bounced72) >= BOUNCE_MIN_COUNT
-              and len(bounced72) / len(sent72) > BOUNCE_PAUSE_RATIO)
-    if paused:
-        log.error("SENDING PAUSED: pichle 72h me %s me se %s bounce (%.0f%%) — limit %.0f%%. "
-                  "Pehle bounce ki wajah dekhein, phir Outreach tab me bounced rows check karein.",
-                  len(sent72), len(bounced72), 100 * len(bounced72) / len(sent72), 100 * BOUNCE_PAUSE_RATIO)
+    # ---- 5) PER-ACCOUNT BREAKER: sirf wo Gmail rest par jis ki bounce rate zyada ho ----
+    paused = False
+    paused_senders, newly = sender_breaker(out_rows, senders, settings, now)
+    for email, b, n, u in newly:
+        set_setting(control_ws, "PAUSED_UNTIL " + email, iso(u))
+        log.error("ACCOUNT REST: %s ke %s me se %s bounce (%.0f%%) — %.0f ghante rest, baqi accounts chalte rahenge. "
+                  "(Jaldi kholna ho to Control tab me us ki 'PAUSED_UNTIL' row ki value hata dein.)",
+                  email, n, b, 100 * b / n, REST_HOURS)
+    for email, u in paused_senders.items():
+        log.warning("%s rest par hai (%s tak) — is run me is se mail nahi jayegi.", email, iso(u))
 
     # ---- 6) quota + sending ----
     total_sent = 0
@@ -1382,6 +1421,8 @@ def run_once():
         known_senders = {x["email"] for x in senders}
 
         for s in senders:
+            if s["email"] in paused_senders:
+                continue
             if total_sent >= max_per_run:
                 break
             quota = min(per_sender - recent.get(s["email"], 0),
